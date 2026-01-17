@@ -1,0 +1,36 @@
+name: soniox-proxy
+region: nyc1
+
+services:
+  - name: soniox-proxy
+    github:
+      repo: Michaelc136/soniox-proxy
+      branch: main
+      deploy_on_push: true
+    dockerfile_path: Dockerfile
+    instance_count: 1
+    http_port: 8080
+    health_check:
+      http_path: /health
+      initial_delay_seconds: 10
+      period_seconds: 10
+      timeout_seconds: 5
+      success_threshold: 1
+      failure_threshold: 3
+    envs:
+      - key: PORT
+        value: "8080"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: SONIOX_API_KEY
+        value: "YOUR_SONIOX_API_KEY_HERE"
+        scope: RUN_TIME
+        type: SECRET
+      - key: SUPABASE_URL
+        value: "https://vhnkwkvonudubyteespy.supabase.co"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: SUPABASE_ANON_KEY
+        value: "YOUR_SUPABASE_ANON_KEY_HERE"
+        scope: RUN_TIME
+        type: SECRET

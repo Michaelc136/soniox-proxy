@@ -8,12 +8,18 @@ config();
 // Configuration from environment variables
 const PORT = process.env.PORT || 8080;
 const SONIOX_API_KEY = process.env.SONIOX_API_KEY;
+const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 
 // Validate required environment variables
 if (!SONIOX_API_KEY) {
     console.error('ERROR: SONIOX_API_KEY environment variable is required');
+    process.exit(1);
+}
+
+if (!DEEPGRAM_API_KEY) {
+    console.error('ERROR: DEEPGRAM_API_KEY environment variable is required');
     process.exit(1);
 }
 
@@ -26,7 +32,19 @@ if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 // Create HTTP server
-const server = createServer((req, res) => {
+const server = createServer(async (req, res) => {
+    // CORS headers for all requests
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    
+    // Handle preflight requests
+    if (req.method === 'OPTIONS') {
+        res.writeHead(200);
+        res.end();
+        return;
+    }
+    
     // Health check endpoint
     if (req.url === '/health' || req.url === '/') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -36,6 +54,46 @@ const server = createServer((req, res) => {
             timestamp: new Date().toISOString()
         }));
         return;
+    }
+    
+    // Deepgram TTS token endpoint - returns API key for authenticated users
+    if (req.url === '/deepgram/token' && req.method === 'POST') {
+        try {
+            // Get authorization header
+            const authHeader = req.headers.authorization;
+            if (!authHeader || !authHeader.startsWith('Bearer ')) {
+                res.writeHead(401, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Unauthorized: No token provided' }));
+                return;
+            }
+            
+            const token = authHeader.substring(7);
+            
+            // Verify JWT with Supabase
+            const { data: { user }, error } = await supabase.auth.getUser(token);
+            
+            if (error || !user) {
+                console.log('Deepgram token request: Auth failed:', error?.message || 'Invalid token');
+                res.writeHead(401, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Unauthorized: Invalid token' }));
+                return;
+            }
+            
+            console.log(`Deepgram token issued for user: ${user.id}`);
+            
+            // Return the Deepgram API key
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ 
+                api_key: DEEPGRAM_API_KEY,
+                expires_in: 3600 // 1 hour (client should request new token before expiry)
+            }));
+            return;
+        } catch (err) {
+            console.error('Deepgram token error:', err.message);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Internal server error' }));
+            return;
+        }
     }
     
     res.writeHead(404);
@@ -48,9 +106,11 @@ const wss = new WebSocketServer({ server });
 // Track active connections
 const connections = new Map();
 
-console.log('Soniox Proxy Server starting...');
+console.log('Selah Translation Proxy Server starting...');
 console.log(`Port: ${PORT}`);
 console.log(`Supabase URL: ${SUPABASE_URL}`);
+console.log(`Soniox API Key: ${SONIOX_API_KEY ? '✓ configured' : '✗ missing'}`);
+console.log(`Deepgram API Key: ${DEEPGRAM_API_KEY ? '✓ configured' : '✗ missing'}`);
 
 wss.on('connection', async (clientWs, req) => {
     const connectionId = generateConnectionId();
@@ -285,9 +345,10 @@ function generateConnectionId() {
 
 // Start the server
 server.listen(PORT, () => {
-    console.log(`✅ Soniox Proxy Server running on port ${PORT}`);
+    console.log(`✅ Selah Translation Proxy running on port ${PORT}`);
     console.log(`   Health check: http://localhost:${PORT}/health`);
-    console.log(`   WebSocket: ws://localhost:${PORT}?token=YOUR_JWT_TOKEN`);
+    console.log(`   Deepgram token: POST http://localhost:${PORT}/deepgram/token`);
+    console.log(`   Soniox WebSocket: ws://localhost:${PORT}?token=YOUR_JWT_TOKEN`);
 });
 
 // Graceful shutdown
