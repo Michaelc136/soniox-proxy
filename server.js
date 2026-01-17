@@ -234,6 +234,19 @@ function handleClientMessage(connectionId, data, isBinary) {
         return;
     }
     
+    // Handle finalize message - flush pending tokens before language switch
+    if (message.type === 'finalize') {
+        console.log(`[${connectionId}] 📝 Received FINALIZE - flushing pending tokens...`);
+        if (conn.sonioxWs && conn.sonioxWs.readyState === WebSocket.OPEN) {
+            // Forward finalize message to Soniox
+            conn.sonioxWs.send(JSON.stringify(message));
+            console.log(`[${connectionId}] Finalize message forwarded to Soniox`);
+        } else {
+            console.log(`[${connectionId}] Cannot finalize - Soniox not connected`);
+        }
+        return;
+    }
+    
     // Forward other messages to Soniox
     console.log(`[${connectionId}] Forwarding message to Soniox:`, JSON.stringify(message).substring(0, 100));
     if (conn.sonioxWs && conn.sonioxWs.readyState === WebSocket.OPEN) {
@@ -275,7 +288,11 @@ function connectToSoniox(connectionId, config) {
             sample_rate: config.sample_rate || 16000,
             num_channels: config.num_channels || 1,
             include_nonfinal: config.include_nonfinal !== false,
-            language_hints: config.language_hints || ['en']
+            language_hints: config.language_hints || ['en'],
+            // Enable endpoint detection to finalize tokens on speech pauses (reduces hanging)
+            enable_endpoint_detection: config.enable_endpoint_detection !== false,
+            // Reduce max non-final duration for faster translation output (default is ~4000-6000ms)
+            max_non_final_tokens_duration_ms: config.max_non_final_tokens_duration_ms || 1500
         };
         
         // Add translation config if present (only target_language for one_way)
