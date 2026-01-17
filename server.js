@@ -155,8 +155,12 @@ wss.on('connection', async (clientWs, req) => {
     };
     connections.set(connectionId, connectionInfo);
     
+    // Send immediate acknowledgment so client knows auth passed
+    console.log(`[${connectionId}] Auth complete, ready to receive messages`);
+    
     // Handle messages from client
     clientWs.on('message', (data, isBinary) => {
+        console.log(`[${connectionId}] Received message: isBinary=${isBinary}, type=${typeof data}, length=${data?.length || 0}`);
         handleClientMessage(connectionId, data, isBinary);
     });
     
@@ -179,8 +183,14 @@ function handleClientMessage(connectionId, data, isBinary) {
         return;
     }
     
-    // If binary data, forward to Soniox
-    if (isBinary || Buffer.isBuffer(data)) {
+    // Convert data to string for inspection
+    const dataStr = data.toString();
+    
+    // Check if it looks like JSON (starts with { or [)
+    const looksLikeJson = dataStr.startsWith('{') || dataStr.startsWith('[');
+    
+    // If binary audio data (not JSON), forward to Soniox
+    if (isBinary && !looksLikeJson) {
         if (conn.sonioxWs && conn.sonioxWs.readyState === WebSocket.OPEN) {
             conn.sonioxWs.send(data);
             // Don't log every audio packet to reduce noise
@@ -193,14 +203,17 @@ function handleClientMessage(connectionId, data, isBinary) {
     // Parse JSON message
     let message;
     try {
-        message = JSON.parse(data.toString());
-    } catch {
-        console.log(`[${connectionId}] Invalid JSON message:`, data.toString().substring(0, 100));
+        message = JSON.parse(dataStr);
+        console.log(`[${connectionId}] Parsed JSON message:`, JSON.stringify(message).substring(0, 200));
+    } catch (err) {
+        console.log(`[${connectionId}] Failed to parse JSON: ${err.message}`);
+        console.log(`[${connectionId}] Raw data (first 200 chars):`, dataStr.substring(0, 200));
         return;
     }
     
     // Handle ping/keepalive
     if (message.type === 'ping') {
+        console.log(`[${connectionId}] Received ping, sending pong`);
         sendToClient(conn.clientWs, {
             type: 'pong',
             ref: message.ref || 0,
@@ -211,28 +224,36 @@ function handleClientMessage(connectionId, data, isBinary) {
     
     // Handle start action - connect to Soniox
     if (message.action === 'start') {
-        console.log(`[${connectionId}] Starting Soniox session...`);
+        console.log(`[${connectionId}] ✅ Received START action - connecting to Soniox...`);
         connectToSoniox(connectionId, message.config || message);
         return;
     }
     
     // Forward other messages to Soniox
+    console.log(`[${connectionId}] Forwarding message to Soniox:`, JSON.stringify(message).substring(0, 100));
     if (conn.sonioxWs && conn.sonioxWs.readyState === WebSocket.OPEN) {
         conn.sonioxWs.send(JSON.stringify(message));
+    } else {
+        console.log(`[${connectionId}] Cannot forward - Soniox not connected (state: ${conn.sonioxWs?.readyState})`);
     }
 }
 
 function connectToSoniox(connectionId, config) {
     const conn = connections.get(connectionId);
-    if (!conn) return;
+    if (!conn) {
+        console.log(`[${connectionId}] connectToSoniox: No connection found!`);
+        return;
+    }
     
     // Close existing Soniox connection if any
     if (conn.sonioxWs) {
+        console.log(`[${connectionId}] Closing existing Soniox connection`);
         conn.sonioxWs.close();
         conn.sonioxWs = null;
     }
     
-    console.log(`[${connectionId}] Connecting to Soniox...`);
+    console.log(`[${connectionId}] 🔗 Connecting to Soniox WebSocket...`);
+    console.log(`[${connectionId}] Config:`, JSON.stringify(config).substring(0, 300));
     
     // Connect to Soniox with API key in header
     const sonioxWs = new WebSocket('wss://stt-rt.soniox.com/transcribe-websocket', {
