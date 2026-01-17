@@ -292,7 +292,7 @@ function connectToSoniox(connectionId, config) {
             // Enable endpoint detection to finalize tokens on speech pauses (reduces hanging)
             enable_endpoint_detection: config.enable_endpoint_detection !== false,
             // Reduce max non-final duration for faster translation output (default is ~4000-6000ms)
-            max_non_final_tokens_duration_ms: config.max_non_final_tokens_duration_ms || 1500
+            max_non_final_tokens_duration_ms: config.max_non_final_tokens_duration_ms || 4000
         };
         
         // Add translation config if present (only target_language for one_way)
