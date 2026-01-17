@@ -279,23 +279,39 @@ function connectToSoniox(connectionId, config) {
         sonioxWs.send(JSON.stringify(sonioxConfig));
         console.log(`[${connectionId}] Sent config to Soniox:`, JSON.stringify(sonioxConfig).substring(0, 200));
         
-        // Notify client that proxy is ready
-        conn.isReady = true;
-        sendToClient(conn.clientWs, {
-            type: 'proxy_ready',
-            connection_id: connectionId
-        });
+        // Don't send proxy_ready yet - wait for Soniox to acknowledge
+        // We'll send it after receiving the first message from Soniox
     });
     
     sonioxWs.on('message', (data) => {
+        const dataStr = data.toString();
+        console.log(`[${connectionId}] Soniox message:`, dataStr.substring(0, 300));
+        
+        // If this is the first message (status/ack), send proxy_ready
+        if (!conn.isReady) {
+            conn.isReady = true;
+            console.log(`[${connectionId}] Soniox acknowledged config, sending proxy_ready to client`);
+            sendToClient(conn.clientWs, {
+                type: 'proxy_ready',
+                connection_id: connectionId
+            });
+        }
+        
         // Forward Soniox response to client
         if (conn.clientWs && conn.clientWs.readyState === WebSocket.OPEN) {
-            conn.clientWs.send(data.toString());
+            conn.clientWs.send(dataStr);
         }
     });
     
     sonioxWs.on('close', (code, reason) => {
-        console.log(`[${connectionId}] Soniox connection closed: ${code} ${reason?.toString() || ''}`);
+        const reasonStr = reason ? reason.toString() : 'No reason provided';
+        console.log(`[${connectionId}] Soniox connection closed: code=${code}, reason="${reasonStr}"`);
+        
+        // Log if this happened before Soniox acknowledged config
+        if (!conn.isReady) {
+            console.error(`[${connectionId}] ⚠️ Soniox closed BEFORE acknowledging config - likely invalid API key or config`);
+        }
+        
         conn.sonioxWs = null;
         conn.isReady = false;
         
@@ -303,7 +319,7 @@ function connectToSoniox(connectionId, config) {
         if (conn.clientWs && conn.clientWs.readyState === WebSocket.OPEN) {
             sendToClient(conn.clientWs, {
                 type: 'error',
-                message: 'Soniox connection closed',
+                message: `Soniox connection closed: ${reasonStr || 'Unknown reason'}`,
                 code: code
             });
         }
