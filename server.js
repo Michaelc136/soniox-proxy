@@ -155,8 +155,13 @@ wss.on('connection', async (clientWs, req) => {
     };
     connections.set(connectionId, connectionInfo);
     
-    // Send immediate acknowledgment so client knows auth passed
-    console.log(`[${connectionId}] Auth complete, ready to receive messages`);
+    // Send immediate acknowledgment so client knows auth passed and server is ready
+    console.log(`[${connectionId}] Auth complete, sending auth_success to client`);
+    sendToClient(clientWs, {
+        type: 'auth_success',
+        message: 'Authenticated, ready for start message',
+        connectionId: connectionId
+    });
     
     // Handle messages from client
     clientWs.on('message', (data, isBinary) => {
