@@ -258,26 +258,41 @@ function connectToSoniox(connectionId, config) {
     }
     
     console.log(`[${connectionId}] 🔗 Connecting to Soniox WebSocket...`);
-    console.log(`[${connectionId}] Config:`, JSON.stringify(config).substring(0, 300));
+    console.log(`[${connectionId}] Client config:`, JSON.stringify(config).substring(0, 300));
     
-    // Connect to Soniox with API key in header
-    const sonioxWs = new WebSocket('wss://stt-rt.soniox.com/transcribe-websocket', {
-        headers: {
-            'Authorization': `Bearer ${SONIOX_API_KEY}`
-        }
-    });
+    // Connect to Soniox (no auth header - API key goes in config JSON per docs)
+    const sonioxWs = new WebSocket('wss://stt-rt.soniox.com/transcribe-websocket');
     
     sonioxWs.on('open', () => {
         console.log(`[${connectionId}] Connected to Soniox`);
         conn.sonioxWs = sonioxWs;
         
-        // Remove 'action' field before sending to Soniox
-        const sonioxConfig = { ...config };
-        delete sonioxConfig.action;
+        // Build Soniox config - API key must be in the JSON config per Soniox docs
+        const sonioxConfig = {
+            api_key: SONIOX_API_KEY,
+            model: config.model || 'stt-rt-preview',
+            audio_format: config.audio_format || 'pcm_s16le',
+            sample_rate: config.sample_rate || 16000,
+            num_channels: config.num_channels || 1,
+            include_nonfinal: config.include_nonfinal !== false,
+            language_hints: config.language_hints || ['en']
+        };
+        
+        // Add translation config if present (only target_language for one_way)
+        if (config.translation) {
+            sonioxConfig.translation = {
+                type: config.translation.type || 'one_way',
+                target_language: config.translation.target_language
+            };
+            // Only add source_language for two_way translation
+            if (config.translation.type === 'two_way' && config.translation.source_language) {
+                sonioxConfig.translation.source_language = config.translation.source_language;
+            }
+        }
         
         // Send config to Soniox
         sonioxWs.send(JSON.stringify(sonioxConfig));
-        console.log(`[${connectionId}] Sent config to Soniox:`, JSON.stringify(sonioxConfig).substring(0, 200));
+        console.log(`[${connectionId}] Sent config to Soniox:`, JSON.stringify(sonioxConfig).substring(0, 300));
         
         // Don't send proxy_ready yet - wait for Soniox to acknowledge
         // We'll send it after receiving the first message from Soniox
