@@ -1,5 +1,8 @@
 FROM node:20-alpine
 
+# Cache buster - change this value to force rebuild
+ARG CACHE_BUST=2026-01-19-openai
+
 WORKDIR /app
 
 # Copy package files
