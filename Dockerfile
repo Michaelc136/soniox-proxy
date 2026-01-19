@@ -1,7 +1,7 @@
 FROM node:20-alpine
 
 # Cache buster - change this value to force rebuild
-ARG CACHE_BUST=2026-01-19-openai
+ARG CACHE_BUST=2026-01-19-openai-v7-force
 
 WORKDIR /app
 
