@@ -8,7 +8,7 @@ config();
 // Configuration from environment variables
 const PORT = process.env.PORT || 8080;
 const SONIOX_API_KEY = process.env.SONIOX_API_KEY;
-const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 
@@ -18,8 +18,8 @@ if (!SONIOX_API_KEY) {
     process.exit(1);
 }
 
-if (!DEEPGRAM_API_KEY) {
-    console.error('ERROR: DEEPGRAM_API_KEY environment variable is required');
+if (!OPENAI_API_KEY) {
+    console.error('ERROR: OPENAI_API_KEY environment variable is required');
     process.exit(1);
 }
 
@@ -56,8 +56,8 @@ const server = createServer(async (req, res) => {
         return;
     }
     
-    // Deepgram TTS token endpoint - returns API key for authenticated users
-    if (req.url === '/deepgram/token' && req.method === 'POST') {
+    // OpenAI TTS token endpoint - returns API key for authenticated users
+    if (req.url === '/openai/token' && req.method === 'POST') {
         try {
             // Get authorization header
             const authHeader = req.headers.authorization;
@@ -73,23 +73,23 @@ const server = createServer(async (req, res) => {
             const { data: { user }, error } = await supabase.auth.getUser(token);
             
             if (error || !user) {
-                console.log('Deepgram token request: Auth failed:', error?.message || 'Invalid token');
+                console.log('OpenAI token request: Auth failed:', error?.message || 'Invalid token');
                 res.writeHead(401, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ error: 'Unauthorized: Invalid token' }));
                 return;
             }
             
-            console.log(`Deepgram token issued for user: ${user.id}`);
+            console.log(`OpenAI token issued for user: ${user.id}`);
             
-            // Return the Deepgram API key
+            // Return the OpenAI API key
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ 
-                api_key: DEEPGRAM_API_KEY,
+                api_key: OPENAI_API_KEY,
                 expires_in: 3600 // 1 hour (client should request new token before expiry)
             }));
             return;
         } catch (err) {
-            console.error('Deepgram token error:', err.message);
+            console.error('OpenAI token error:', err.message);
             res.writeHead(500, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ error: 'Internal server error' }));
             return;
@@ -110,7 +110,7 @@ console.log('Selah Translation Proxy Server starting...');
 console.log(`Port: ${PORT}`);
 console.log(`Supabase URL: ${SUPABASE_URL}`);
 console.log(`Soniox API Key: ${SONIOX_API_KEY ? '✓ configured' : '✗ missing'}`);
-console.log(`Deepgram API Key: ${DEEPGRAM_API_KEY ? '✓ configured' : '✗ missing'}`);
+console.log(`OpenAI API Key: ${OPENAI_API_KEY ? '✓ configured' : '✗ missing'}`);
 
 wss.on('connection', async (clientWs, req) => {
     const connectionId = generateConnectionId();
@@ -421,7 +421,7 @@ function generateConnectionId() {
 server.listen(PORT, () => {
     console.log(`✅ Selah Translation Proxy running on port ${PORT}`);
     console.log(`   Health check: http://localhost:${PORT}/health`);
-    console.log(`   Deepgram token: POST http://localhost:${PORT}/deepgram/token`);
+    console.log(`   OpenAI token: POST http://localhost:${PORT}/openai/token`);
     console.log(`   Soniox WebSocket: ws://localhost:${PORT}?token=YOUR_JWT_TOKEN`);
 });
 
