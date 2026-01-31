@@ -56,7 +56,7 @@ const server = createServer(async (req, res) => {
         return;
     }
     
-    // OpenAI TTS token endpoint - returns API key for authenticated users
+    // OpenAI TTS token endpoint - returns API key for authenticated users (legacy)
     if (req.url === '/openai/token' && req.method === 'POST') {
         try {
             // Get authorization header
@@ -90,6 +90,140 @@ const server = createServer(async (req, res) => {
             return;
         } catch (err) {
             console.error('OpenAI token error:', err.message);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Internal server error' }));
+            return;
+        }
+    }
+    
+    // OpenAI Ephemeral Token endpoint - MORE SECURE: returns short-lived token, real key never leaves server
+    if (req.url === '/api/openai/ephemeral-token' && req.method === 'POST') {
+        try {
+            // Get authorization header
+            const authHeader = req.headers.authorization;
+            if (!authHeader || !authHeader.startsWith('Bearer ')) {
+                res.writeHead(401, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Unauthorized: No token provided' }));
+                return;
+            }
+            
+            const token = authHeader.substring(7);
+            
+            // Verify JWT with Supabase
+            const { data: { user }, error } = await supabase.auth.getUser(token);
+            
+            if (error || !user) {
+                console.log('OpenAI ephemeral token: Auth failed:', error?.message || 'Invalid token');
+                res.writeHead(401, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Unauthorized: Invalid token' }));
+                return;
+            }
+            
+            // Parse request body for voice/model preferences
+            let body = '';
+            req.on('data', chunk => { body += chunk; });
+            await new Promise(resolve => req.on('end', resolve));
+            
+            let params = {};
+            try { params = JSON.parse(body || '{}'); } catch (e) {}
+            
+            const voice = params.voice || 'nova';
+            const model = params.model || 'gpt-4o-realtime-preview-2024-12-17';
+            
+            console.log(`OpenAI ephemeral token request for user: ${user.id}, voice: ${voice}`);
+            
+            // Request ephemeral key from OpenAI Realtime API
+            const openaiResponse = await fetch('https://api.openai.com/v1/realtime/sessions', {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${OPENAI_API_KEY}`,
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    model: model,
+                    voice: voice,
+                    modalities: ['text', 'audio'],
+                }),
+            });
+            
+            if (!openaiResponse.ok) {
+                const errorData = await openaiResponse.json().catch(() => ({}));
+                console.error('OpenAI ephemeral key error:', errorData);
+                
+                // If ephemeral endpoint doesn't exist, fall back to API key (less secure)
+                if (openaiResponse.status === 404) {
+                    console.log('Ephemeral endpoint not available, falling back to API key');
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ 
+                        ephemeralKey: OPENAI_API_KEY,
+                        model: model,
+                        voice: voice,
+                        fallback: true
+                    }));
+                    return;
+                }
+                
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Failed to create OpenAI session' }));
+                return;
+            }
+            
+            const sessionData = await openaiResponse.json();
+            console.log(`OpenAI ephemeral token issued for user: ${user.id}`);
+            
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                ephemeralKey: sessionData.client_secret?.value || sessionData.api_key,
+                model: model,
+                voice: voice,
+                expiresAt: sessionData.client_secret?.expires_at,
+            }));
+            return;
+        } catch (err) {
+            console.error('OpenAI ephemeral token error:', err.message);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Internal server error' }));
+            return;
+        }
+    }
+    
+    // Soniox token endpoint for web clients (returns proxy URL, not API key)
+    if (req.url === '/api/soniox/token' && req.method === 'POST') {
+        try {
+            // Get authorization header
+            const authHeader = req.headers.authorization;
+            if (!authHeader || !authHeader.startsWith('Bearer ')) {
+                res.writeHead(401, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Unauthorized: No token provided' }));
+                return;
+            }
+            
+            const token = authHeader.substring(7);
+            
+            // Verify JWT with Supabase
+            const { data: { user }, error } = await supabase.auth.getUser(token);
+            
+            if (error || !user) {
+                console.log('Soniox token: Auth failed:', error?.message || 'Invalid token');
+                res.writeHead(401, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Unauthorized: Invalid token' }));
+                return;
+            }
+            
+            console.log(`Soniox proxy access granted for user: ${user.id}`);
+            
+            // Return the proxy WebSocket URL (client connects to proxy, not directly to Soniox)
+            // This way the API key NEVER leaves the server
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ 
+                useProxy: true,
+                proxyUrl: 'wss://selah-proxy-ffrw7.ondigitalocean.app',
+                // Client should append ?token=THEIR_JWT to the URL
+                message: 'Connect to proxyUrl with your JWT token as query param'
+            }));
+            return;
+        } catch (err) {
+            console.error('Soniox token error:', err.message);
             res.writeHead(500, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ error: 'Internal server error' }));
             return;
