@@ -554,11 +554,12 @@ function handleClientMessage(connectionId, data, isBinary) {
     if (message.action === 'start') {
         console.log(`[${connectionId}] ✅ Received START action - connecting to Soniox...`);
         const configToUse = message.config || message;
+        const translation = configToUse.translation || {};
         console.log(`[${connectionId}] Config structure:`, JSON.stringify({
             hasTranslation: !!configToUse.translation,
-            translation: configToUse.translation,
-            targetLang: configToUse.translation?.target_language,
-            sourceLang: configToUse.translation?.source_language
+            translation: translation,
+            targetLang: translation.target_language,
+            sourceLang: translation.source_language
         }));
         connectToSoniox(connectionId, configToUse);
         return;
