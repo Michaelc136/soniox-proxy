@@ -9,6 +9,7 @@ config();
 const PORT = process.env.PORT || 8080;
 const SONIOX_API_KEY = process.env.SONIOX_API_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 
@@ -21,6 +22,10 @@ if (!SONIOX_API_KEY) {
 if (!OPENAI_API_KEY) {
     console.error('ERROR: OPENAI_API_KEY environment variable is required');
     process.exit(1);
+}
+
+if (!DEEPGRAM_API_KEY) {
+    console.error('WARNING: DEEPGRAM_API_KEY not configured - Deepgram TTS will not be available');
 }
 
 if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
@@ -230,6 +235,189 @@ const server = createServer(async (req, res) => {
         }
     }
     
+    // OpenAI TTS endpoint - converts text to speech using OpenAI's audio/speech API
+    // Returns audio data directly (mp3 format)
+    if (req.url === '/api/openai/tts' && req.method === 'POST') {
+        try {
+            // Get authorization header
+            const authHeader = req.headers.authorization;
+            if (!authHeader || !authHeader.startsWith('Bearer ')) {
+                res.writeHead(401, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Unauthorized: No token provided' }));
+                return;
+            }
+            
+            const token = authHeader.substring(7);
+            
+            // Verify JWT with Supabase
+            const { data: { user }, error } = await supabase.auth.getUser(token);
+            
+            if (error || !user) {
+                console.log('OpenAI TTS: Auth failed:', error?.message || 'Invalid token');
+                res.writeHead(401, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Unauthorized: Invalid token' }));
+                return;
+            }
+            
+            // Parse request body
+            let body = '';
+            req.on('data', chunk => { body += chunk; });
+            await new Promise(resolve => req.on('end', resolve));
+            
+            let params = {};
+            try { params = JSON.parse(body || '{}'); } catch (e) {}
+            
+            const text = params.text || params.input;
+            const voice = params.voice || 'nova';
+            const model = params.model || 'tts-1';
+            const speed = params.speed || 1.0;
+            
+            if (!text) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Missing required field: text' }));
+                return;
+            }
+            
+            console.log(`OpenAI TTS request for user: ${user.id}, voice: ${voice}, text length: ${text.length}`);
+            
+            // Call OpenAI's TTS API
+            const openaiResponse = await fetch('https://api.openai.com/v1/audio/speech', {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${OPENAI_API_KEY}`,
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    model: model,
+                    input: text,
+                    voice: voice,
+                    speed: speed,
+                    response_format: 'mp3',
+                }),
+            });
+            
+            if (!openaiResponse.ok) {
+                const errorText = await openaiResponse.text();
+                console.error('OpenAI TTS error:', openaiResponse.status, errorText);
+                res.writeHead(openaiResponse.status, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'OpenAI TTS failed: ' + errorText }));
+                return;
+            }
+            
+            // Stream the audio response back to client
+            const audioData = await openaiResponse.arrayBuffer();
+            console.log(`OpenAI TTS success for user: ${user.id}, audio size: ${audioData.byteLength} bytes`);
+            
+            res.writeHead(200, { 
+                'Content-Type': 'audio/mpeg',
+                'Content-Length': audioData.byteLength,
+            });
+            res.end(Buffer.from(audioData));
+            return;
+        } catch (err) {
+            console.error('OpenAI TTS error:', err.message);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Internal server error' }));
+            return;
+        }
+    }
+    
+    // Deepgram TTS endpoint - converts text to speech using Deepgram's Aura voices
+    // More cost-effective and faster than OpenAI for real-time streaming
+    if (req.url === '/api/deepgram/tts' && req.method === 'POST') {
+        try {
+            if (!DEEPGRAM_API_KEY) {
+                res.writeHead(503, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Deepgram TTS not configured' }));
+                return;
+            }
+            
+            // Get authorization header
+            const authHeader = req.headers.authorization;
+            if (!authHeader || !authHeader.startsWith('Bearer ')) {
+                res.writeHead(401, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Unauthorized: No token provided' }));
+                return;
+            }
+            
+            const token = authHeader.substring(7);
+            
+            // Verify JWT with Supabase
+            const { data: { user }, error } = await supabase.auth.getUser(token);
+            
+            if (error || !user) {
+                console.log('Deepgram TTS: Auth failed:', error?.message || 'Invalid token');
+                res.writeHead(401, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Unauthorized: Invalid token' }));
+                return;
+            }
+            
+            // Parse request body
+            let body = '';
+            req.on('data', chunk => { body += chunk; });
+            await new Promise(resolve => req.on('end', resolve));
+            
+            let params = {};
+            try { params = JSON.parse(body || '{}'); } catch (e) {}
+            
+            const text = params.text || params.input;
+            // Deepgram Aura voices: aura-asteria-en, aura-luna-en, aura-stella-en, aura-athena-en, aura-hera-en, aura-orion-en, aura-arcas-en, aura-perseus-en, aura-angus-en, aura-orpheus-en, aura-helios-en, aura-zeus-en
+            const model = params.model || 'aura-asteria-en';
+            const encoding = params.encoding || 'mp3';
+            
+            if (!text) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Missing required field: text' }));
+                return;
+            }
+            
+            console.log(`Deepgram TTS request for user: ${user.id}, model: ${model}, text length: ${text.length}`);
+            
+            // Call Deepgram's TTS API
+            // API: https://api.deepgram.com/v1/speak?model={model}&encoding={encoding}
+            const deepgramUrl = `https://api.deepgram.com/v1/speak?model=${encodeURIComponent(model)}&encoding=${encoding}`;
+            
+            const deepgramResponse = await fetch(deepgramUrl, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Token ${DEEPGRAM_API_KEY}`,
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ text }),
+            });
+            
+            if (!deepgramResponse.ok) {
+                const errorText = await deepgramResponse.text();
+                console.error('Deepgram TTS error:', deepgramResponse.status, errorText);
+                res.writeHead(deepgramResponse.status, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Deepgram TTS failed: ' + errorText }));
+                return;
+            }
+            
+            // Stream the audio response back to client
+            const audioData = await deepgramResponse.arrayBuffer();
+            console.log(`Deepgram TTS success for user: ${user.id}, audio size: ${audioData.byteLength} bytes`);
+            
+            // Content type based on encoding
+            const contentType = encoding === 'mp3' ? 'audio/mpeg' : 
+                               encoding === 'wav' ? 'audio/wav' :
+                               encoding === 'opus' ? 'audio/opus' :
+                               encoding === 'flac' ? 'audio/flac' : 'audio/mpeg';
+            
+            res.writeHead(200, { 
+                'Content-Type': contentType,
+                'Content-Length': audioData.byteLength,
+            });
+            res.end(Buffer.from(audioData));
+            return;
+        } catch (err) {
+            console.error('Deepgram TTS error:', err.message);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Internal server error' }));
+            return;
+        }
+    }
+    
     res.writeHead(404);
     res.end('Not Found');
 });
@@ -245,6 +433,7 @@ console.log(`Port: ${PORT}`);
 console.log(`Supabase URL: ${SUPABASE_URL}`);
 console.log(`Soniox API Key: ${SONIOX_API_KEY ? '✓ configured' : '✗ missing'}`);
 console.log(`OpenAI API Key: ${OPENAI_API_KEY ? '✓ configured' : '✗ missing'}`);
+console.log(`Deepgram API Key: ${DEEPGRAM_API_KEY ? '✓ configured' : '✗ missing'}`);
 
 wss.on('connection', async (clientWs, req) => {
     const connectionId = generateConnectionId();
@@ -555,7 +744,8 @@ function generateConnectionId() {
 server.listen(PORT, () => {
     console.log(`✅ Selah Translation Proxy running on port ${PORT}`);
     console.log(`   Health check: http://localhost:${PORT}/health`);
-    console.log(`   OpenAI token: POST http://localhost:${PORT}/openai/token`);
+    console.log(`   OpenAI TTS: POST http://localhost:${PORT}/api/openai/tts`);
+    console.log(`   Deepgram TTS: POST http://localhost:${PORT}/api/deepgram/tts`);
     console.log(`   Soniox WebSocket: ws://localhost:${PORT}?token=YOUR_JWT_TOKEN`);
 });
 
