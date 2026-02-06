@@ -460,6 +460,8 @@ const server = createServer(async (req, res) => {
             const voice = params.voice || 'nova';
             const model = params.model || 'tts-1';
             const responseFormat = params.response_format || 'mp3';
+            // Speed: 0.25 to 4.0, default 1.1 for slightly faster playback
+            const speed = Math.min(4.0, Math.max(0.25, parseFloat(params.speed) || 1.1));
             
             if (!text) {
                 res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -467,7 +469,7 @@ const server = createServer(async (req, res) => {
                 return;
             }
             
-            console.log(`OpenAI TTS request for user: ${user.id}, voice: ${voice}, model: ${model}, text length: ${text.length}`);
+            console.log(`OpenAI TTS request for user: ${user.id}, voice: ${voice}, model: ${model}, speed: ${speed}, text length: ${text.length}`);
             
             // Call OpenAI's TTS API
             const openaiResponse = await fetch('https://api.openai.com/v1/audio/speech', {
@@ -480,6 +482,7 @@ const server = createServer(async (req, res) => {
                     model: model,
                     input: text,
                     voice: voice,
+                    speed: speed,
                     response_format: responseFormat,
                 }),
             });
