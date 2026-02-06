@@ -618,14 +618,14 @@ function connectToSoniox(connectionId, config) {
             max_non_final_tokens_duration_ms: config.max_non_final_tokens_duration_ms || 4000
         };
         
-        // Add translation config if present (only target_language for one_way)
+        // Add translation config if present
         if (config.translation) {
             sonioxConfig.translation = {
                 type: config.translation.type || 'one_way',
                 target_language: config.translation.target_language
             };
-            // Only add source_language for two_way translation
-            if (config.translation.type === 'two_way' && config.translation.source_language) {
+            // Add source_language if provided (required for translation to work)
+            if (config.translation.source_language) {
                 sonioxConfig.translation.source_language = config.translation.source_language;
             }
         }
