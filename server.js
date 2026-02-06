@@ -553,7 +553,14 @@ function handleClientMessage(connectionId, data, isBinary) {
     // Handle start action - connect to Soniox
     if (message.action === 'start') {
         console.log(`[${connectionId}] ✅ Received START action - connecting to Soniox...`);
-        connectToSoniox(connectionId, message.config || message);
+        const configToUse = message.config || message;
+        console.log(`[${connectionId}] Config structure:`, JSON.stringify({
+            hasTranslation: !!configToUse.translation,
+            translation: configToUse.translation,
+            targetLang: configToUse.translation?.target_language,
+            sourceLang: configToUse.translation?.source_language
+        }));
+        connectToSoniox(connectionId, configToUse);
         return;
     }
     
@@ -620,14 +627,29 @@ function connectToSoniox(connectionId, config) {
         
         // Add translation config if present
         if (config.translation) {
-            sonioxConfig.translation = {
-                type: config.translation.type || 'one_way',
-                target_language: config.translation.target_language
-            };
-            // Add source_language if provided (required for translation to work)
-            if (config.translation.source_language) {
-                sonioxConfig.translation.source_language = config.translation.source_language;
+            const targetLang = config.translation.target_language;
+            const sourceLang = config.translation.source_language;
+            
+            if (!targetLang) {
+                console.error(`[${connectionId}] ⚠️ Translation config missing target_language!`, JSON.stringify(config.translation));
+                console.error(`[${connectionId}] Full config received:`, JSON.stringify(config).substring(0, 500));
+            } else {
+                console.log(`[${connectionId}] ✅ Translation config - source: ${sourceLang || 'auto'}, target: ${targetLang}`);
+                
+                sonioxConfig.translation = {
+                    type: config.translation.type || 'one_way',
+                    target_language: targetLang
+                };
+                // Add source_language if provided (required for translation to work)
+                if (sourceLang) {
+                    sonioxConfig.translation.source_language = sourceLang;
+                }
+                
+                console.log(`[${connectionId}] Final Soniox translation config:`, JSON.stringify(sonioxConfig.translation));
             }
+        } else {
+            console.log(`[${connectionId}] ⚠️ No translation config provided in config object`);
+            console.log(`[${connectionId}] Config keys:`, Object.keys(config));
         }
         
         // Send config to Soniox
