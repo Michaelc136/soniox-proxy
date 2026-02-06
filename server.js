@@ -418,6 +418,104 @@ const server = createServer(async (req, res) => {
         }
     }
     
+    // OpenAI TTS endpoint - converts text to speech using OpenAI's voices
+    if (req.url === '/api/openai/tts' && req.method === 'POST') {
+        try {
+            if (!OPENAI_API_KEY) {
+                res.writeHead(503, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'OpenAI TTS not configured' }));
+                return;
+            }
+            
+            // Get authorization header
+            const authHeader = req.headers.authorization;
+            if (!authHeader || !authHeader.startsWith('Bearer ')) {
+                res.writeHead(401, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Unauthorized: No token provided' }));
+                return;
+            }
+            
+            const token = authHeader.substring(7);
+            
+            // Verify JWT with Supabase
+            const { data: { user }, error } = await supabase.auth.getUser(token);
+            
+            if (error || !user) {
+                console.log('OpenAI TTS: Auth failed:', error?.message || 'Invalid token');
+                res.writeHead(401, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Unauthorized: Invalid token' }));
+                return;
+            }
+            
+            // Parse request body
+            let body = '';
+            req.on('data', chunk => { body += chunk; });
+            await new Promise(resolve => req.on('end', resolve));
+            
+            let params = {};
+            try { params = JSON.parse(body || '{}'); } catch (e) {}
+            
+            const text = params.text || params.input;
+            // OpenAI voices: alloy, echo, fable, onyx, nova, shimmer
+            const voice = params.voice || 'nova';
+            const model = params.model || 'tts-1';
+            const responseFormat = params.response_format || 'mp3';
+            
+            if (!text) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Missing required field: text' }));
+                return;
+            }
+            
+            console.log(`OpenAI TTS request for user: ${user.id}, voice: ${voice}, model: ${model}, text length: ${text.length}`);
+            
+            // Call OpenAI's TTS API
+            const openaiResponse = await fetch('https://api.openai.com/v1/audio/speech', {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${OPENAI_API_KEY}`,
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    model: model,
+                    input: text,
+                    voice: voice,
+                    response_format: responseFormat,
+                }),
+            });
+            
+            if (!openaiResponse.ok) {
+                const errorText = await openaiResponse.text();
+                console.error('OpenAI TTS error:', openaiResponse.status, errorText);
+                res.writeHead(openaiResponse.status, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'OpenAI TTS failed: ' + errorText }));
+                return;
+            }
+            
+            // Stream the audio response back to client
+            const audioData = await openaiResponse.arrayBuffer();
+            console.log(`OpenAI TTS success for user: ${user.id}, audio size: ${audioData.byteLength} bytes`);
+            
+            // Content type based on format
+            const contentType = responseFormat === 'mp3' ? 'audio/mpeg' : 
+                               responseFormat === 'opus' ? 'audio/opus' :
+                               responseFormat === 'aac' ? 'audio/aac' :
+                               responseFormat === 'flac' ? 'audio/flac' : 'audio/mpeg';
+            
+            res.writeHead(200, { 
+                'Content-Type': contentType,
+                'Content-Length': audioData.byteLength,
+            });
+            res.end(Buffer.from(audioData));
+            return;
+        } catch (err) {
+            console.error('OpenAI TTS error:', err.message);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Internal server error' }));
+            return;
+        }
+    }
+    
     res.writeHead(404);
     res.end('Not Found');
 });
