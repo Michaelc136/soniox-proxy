@@ -61,8 +61,10 @@ const server = createServer(async (req, res) => {
         return;
     }
     
-    // OpenAI TTS token endpoint - returns API key for authenticated users (legacy)
+    // DEPRECATED: OpenAI TTS token endpoint - returns raw API key (INSECURE)
+    // Use /api/openai/ephemeral-token instead - scheduled for removal 2026-04-01
     if (req.url === '/openai/token' && req.method === 'POST') {
+        console.warn(`[DEPRECATED] /openai/token endpoint called - clients should migrate to /api/openai/ephemeral-token`);
         try {
             // Get authorization header
             const authHeader = req.headers.authorization;
@@ -84,13 +86,18 @@ const server = createServer(async (req, res) => {
                 return;
             }
             
-            console.log(`OpenAI token issued for user: ${user.id}`);
+            console.log(`[DEPRECATED] OpenAI token issued for user: ${user.id} - migrate to /api/openai/ephemeral-token`);
             
-            // Return the OpenAI API key
-            res.writeHead(200, { 'Content-Type': 'application/json' });
+            // Return the OpenAI API key (DEPRECATED - exposes raw key)
+            res.writeHead(200, { 
+                'Content-Type': 'application/json',
+                'X-Deprecated': 'This endpoint is deprecated. Use /api/openai/ephemeral-token instead.'
+            });
             res.end(JSON.stringify({ 
                 api_key: OPENAI_API_KEY,
-                expires_in: 3600 // 1 hour (client should request new token before expiry)
+                expires_in: 3600,
+                deprecated: true,
+                migration_notice: 'Use /api/openai/ephemeral-token for better security'
             }));
             return;
         } catch (err) {
@@ -132,10 +139,25 @@ const server = createServer(async (req, res) => {
             let params = {};
             try { params = JSON.parse(body || '{}'); } catch (e) {}
             
-            const voice = params.voice || 'nova';
+            const requestedVoice = params.voice || 'nova';
             const model = params.model || 'gpt-4o-realtime-preview-2024-12-17';
             
-            console.log(`OpenAI ephemeral token request for user: ${user.id}, voice: ${voice}`);
+            // The Realtime Sessions API supports a different voice set than /v1/audio/speech.
+            // Map standard TTS voices to their Realtime equivalents so both clients work.
+            const REALTIME_VOICE_MAP = {
+                'nova': 'coral',
+                'shimmer': 'shimmer',
+                'alloy': 'alloy',
+                'echo': 'echo',
+                'fable': 'sage',
+                'onyx': 'ash',
+            };
+            const VALID_REALTIME_VOICES = ['alloy', 'ash', 'ballad', 'coral', 'echo', 'sage', 'shimmer', 'verse', 'marin', 'cedar'];
+            const voice = VALID_REALTIME_VOICES.includes(requestedVoice) 
+                ? requestedVoice 
+                : (REALTIME_VOICE_MAP[requestedVoice] || 'coral');
+            
+            console.log(`OpenAI ephemeral token request for user: ${user.id}, voice: ${requestedVoice} -> ${voice}`);
             
             // Request ephemeral key from OpenAI Realtime API
             const openaiResponse = await fetch('https://api.openai.com/v1/realtime/sessions', {
@@ -540,9 +562,24 @@ wss.on('connection', async (clientWs, req) => {
     const connectionId = generateConnectionId();
     console.log(`[${connectionId}] New client connection from ${req.socket.remoteAddress}`);
     
-    // Parse token from query string
+    // Parse auth token from query string (standard for WebSocket auth over wss://).
+    // The connection is TLS-encrypted end-to-end so the token is not exposed in transit.
+    // Sec-WebSocket-Protocol headers are stripped by DigitalOcean/Cloudflare reverse proxies.
+    let token = null;
     const url = new URL(req.url, `http://${req.headers.host}`);
-    const token = url.searchParams.get('token');
+    token = url.searchParams.get('token');
+    
+    // Fallback: try Sec-WebSocket-Protocol header (for direct connections without reverse proxy)
+    if (!token) {
+        const protocols = req.headers['sec-websocket-protocol'];
+        if (protocols) {
+            const protocolParts = protocols.split(',').map(p => p.trim());
+            const bearerProtocol = protocolParts.find(p => p.startsWith('Bearer.'));
+            if (bearerProtocol) {
+                token = bearerProtocol.replace('Bearer.', '');
+            }
+        }
+    }
     
     if (!token) {
         console.log(`[${connectionId}] No token provided, closing connection`);
@@ -562,7 +599,9 @@ wss.on('connection', async (clientWs, req) => {
             return;
         }
         
-        console.log(`[${connectionId}] User authenticated: ${user.id} (${user.email})`);
+        // Log authentication success without exposing full email (redact for privacy)
+        const emailHint = user.email ? user.email.substring(0, 3) + '***' : 'unknown';
+        console.log(`[${connectionId}] User authenticated: ${user.id} (${emailHint})`);
     } catch (err) {
         console.error(`[${connectionId}] Auth error:`, err.message);
         sendError(clientWs, 'Authentication error', 500);
