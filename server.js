@@ -258,7 +258,7 @@ const server = createServer(async (req, res) => {
     }
     
     // OpenAI TTS endpoint - converts text to speech using OpenAI's audio/speech API
-    // Returns audio data directly (mp3 format)
+    // Supports streaming for low-latency playback (PCM) and buffered for web (mp3/opus)
     if (req.url === '/api/openai/tts' && req.method === 'POST') {
         try {
             // Get authorization header
@@ -293,6 +293,7 @@ const server = createServer(async (req, res) => {
             const voice = params.voice || 'nova';
             const model = params.model || 'tts-1';
             const speed = params.speed || 1.0;
+            const responseFormat = params.response_format || 'mp3';
             
             if (!text) {
                 res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -300,7 +301,7 @@ const server = createServer(async (req, res) => {
                 return;
             }
             
-            console.log(`OpenAI TTS request for user: ${user.id}, voice: ${voice}, text length: ${text.length}`);
+            console.log(`OpenAI TTS request for user: ${user.id}, voice: ${voice}, format: ${responseFormat}, text length: ${text.length}`);
             
             // Call OpenAI's TTS API
             const openaiResponse = await fetch('https://api.openai.com/v1/audio/speech', {
@@ -314,7 +315,7 @@ const server = createServer(async (req, res) => {
                     input: text,
                     voice: voice,
                     speed: speed,
-                    response_format: 'mp3',
+                    response_format: responseFormat,
                 }),
             });
             
@@ -326,12 +327,44 @@ const server = createServer(async (req, res) => {
                 return;
             }
             
-            // Stream the audio response back to client
+            const FORMAT_CONTENT_TYPES = {
+                'mp3': 'audio/mpeg',
+                'opus': 'audio/ogg',
+                'aac': 'audio/aac',
+                'flac': 'audio/flac',
+                'wav': 'audio/wav',
+                'pcm': 'audio/pcm',
+            };
+            const contentType = FORMAT_CONTENT_TYPES[responseFormat] || 'audio/mpeg';
+            
+            // For PCM/streaming formats, pipe directly for lowest latency
+            if (responseFormat === 'pcm' && openaiResponse.body) {
+                res.writeHead(200, { 
+                    'Content-Type': contentType,
+                    'Transfer-Encoding': 'chunked',
+                });
+                const reader = openaiResponse.body.getReader();
+                try {
+                    while (true) {
+                        const { done, value } = await reader.read();
+                        if (done) break;
+                        res.write(Buffer.from(value));
+                    }
+                } catch (streamErr) {
+                    console.error('OpenAI TTS stream error:', streamErr.message);
+                } finally {
+                    res.end();
+                }
+                console.log(`OpenAI TTS streamed for user: ${user.id}`);
+                return;
+            }
+            
+            // For compressed formats, buffer then send (content-length needed for web playback)
             const audioData = await openaiResponse.arrayBuffer();
             console.log(`OpenAI TTS success for user: ${user.id}, audio size: ${audioData.byteLength} bytes`);
             
             res.writeHead(200, { 
-                'Content-Type': 'audio/mpeg',
+                'Content-Type': contentType,
                 'Content-Length': audioData.byteLength,
             });
             res.end(Buffer.from(audioData));
