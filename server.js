@@ -61,54 +61,14 @@ const server = createServer(async (req, res) => {
         return;
     }
     
-    // DEPRECATED: OpenAI TTS token endpoint - returns raw API key (INSECURE)
-    // Use /api/openai/ephemeral-token instead - scheduled for removal 2026-04-01
+    // Legacy /openai/token endpoint removed - raw API key exposure eliminated
     if (req.url === '/openai/token' && req.method === 'POST') {
-        console.warn(`[DEPRECATED] /openai/token endpoint called - clients should migrate to /api/openai/ephemeral-token`);
-        try {
-            // Get authorization header
-            const authHeader = req.headers.authorization;
-            if (!authHeader || !authHeader.startsWith('Bearer ')) {
-                res.writeHead(401, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ error: 'Unauthorized: No token provided' }));
-                return;
-            }
-            
-            const token = authHeader.substring(7);
-            
-            // Verify JWT with Supabase
-            const { data: { user }, error } = await supabase.auth.getUser(token);
-            
-            if (error || !user) {
-                console.log('OpenAI token request: Auth failed:', error?.message || 'Invalid token');
-                res.writeHead(401, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ error: 'Unauthorized: Invalid token' }));
-                return;
-            }
-            
-            console.log(`[DEPRECATED] OpenAI token issued for user: ${user.id} - migrate to /api/openai/ephemeral-token`);
-            
-            // Return the OpenAI API key (DEPRECATED - exposes raw key)
-            res.writeHead(200, { 
-                'Content-Type': 'application/json',
-                'X-Deprecated': 'This endpoint is deprecated. Use /api/openai/ephemeral-token instead.'
-            });
-            res.end(JSON.stringify({ 
-                api_key: OPENAI_API_KEY,
-                expires_in: 3600,
-                deprecated: true,
-                migration_notice: 'Use /api/openai/ephemeral-token for better security'
-            }));
-            return;
-        } catch (err) {
-            console.error('OpenAI token error:', err.message);
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: 'Internal server error' }));
-            return;
-        }
+        res.writeHead(410, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'This endpoint has been removed. Use /api/openai/tts for TTS or /api/openai/chat for chat.' }));
+        return;
     }
     
-    // OpenAI Ephemeral Token endpoint - MORE SECURE: returns short-lived token, real key never leaves server
+    // OpenAI Ephemeral Token endpoint - returns short-lived Realtime session token
     if (req.url === '/api/openai/ephemeral-token' && req.method === 'POST') {
         try {
             // Get authorization header
@@ -175,22 +135,9 @@ const server = createServer(async (req, res) => {
             
             if (!openaiResponse.ok) {
                 const errorData = await openaiResponse.json().catch(() => ({}));
-                console.error('OpenAI ephemeral key error:', errorData);
+                console.error('OpenAI ephemeral key error:', openaiResponse.status, errorData);
                 
-                // If ephemeral endpoint doesn't exist, fall back to API key (less secure)
-                if (openaiResponse.status === 404) {
-                    console.log('Ephemeral endpoint not available, falling back to API key');
-                    res.writeHead(200, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ 
-                        ephemeralKey: OPENAI_API_KEY,
-                        model: model,
-                        voice: voice,
-                        fallback: true
-                    }));
-                    return;
-                }
-                
-                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.writeHead(openaiResponse.status >= 400 && openaiResponse.status < 600 ? openaiResponse.status : 500, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ error: 'Failed to create OpenAI session' }));
                 return;
             }
@@ -473,16 +420,9 @@ const server = createServer(async (req, res) => {
         }
     }
     
-    // OpenAI TTS endpoint - converts text to speech using OpenAI's voices
-    if (req.url === '/api/openai/tts' && req.method === 'POST') {
+    // OpenAI Chat Completions proxy - proxies requests to OpenAI so API key stays on server
+    if (req.url === '/api/openai/chat' && req.method === 'POST') {
         try {
-            if (!OPENAI_API_KEY) {
-                res.writeHead(503, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ error: 'OpenAI TTS not configured' }));
-                return;
-            }
-            
-            // Get authorization header
             const authHeader = req.headers.authorization;
             if (!authHeader || !authHeader.startsWith('Bearer ')) {
                 res.writeHead(401, { 'Content-Type': 'application/json' });
@@ -491,18 +431,15 @@ const server = createServer(async (req, res) => {
             }
             
             const token = authHeader.substring(7);
-            
-            // Verify JWT with Supabase
             const { data: { user }, error } = await supabase.auth.getUser(token);
             
             if (error || !user) {
-                console.log('OpenAI TTS: Auth failed:', error?.message || 'Invalid token');
+                console.log('OpenAI Chat: Auth failed:', error?.message || 'Invalid token');
                 res.writeHead(401, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ error: 'Unauthorized: Invalid token' }));
                 return;
             }
             
-            // Parse request body
             let body = '';
             req.on('data', chunk => { body += chunk; });
             await new Promise(resolve => req.on('end', resolve));
@@ -510,64 +447,110 @@ const server = createServer(async (req, res) => {
             let params = {};
             try { params = JSON.parse(body || '{}'); } catch (e) {}
             
-            const text = params.text || params.input;
-            // OpenAI voices: alloy, echo, fable, onyx, nova, shimmer
-            const voice = params.voice || 'nova';
-            const model = params.model || 'tts-1';
-            const responseFormat = params.response_format || 'mp3';
-            // Speed: 0.25 to 4.0, default 1.1 for slightly faster playback
-            const speed = Math.min(4.0, Math.max(0.25, parseFloat(params.speed) || 1.1));
+            console.log(`OpenAI Chat request for user: ${user.id}, model: ${params.model || 'gpt-4'}`);
             
-            if (!text) {
-                res.writeHead(400, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ error: 'Missing required field: text' }));
-                return;
-            }
-            
-            console.log(`OpenAI TTS request for user: ${user.id}, voice: ${voice}, model: ${model}, speed: ${speed}, text length: ${text.length}`);
-            
-            // Call OpenAI's TTS API
-            const openaiResponse = await fetch('https://api.openai.com/v1/audio/speech', {
+            const openaiResponse = await fetch('https://api.openai.com/v1/chat/completions', {
                 method: 'POST',
                 headers: {
                     'Authorization': `Bearer ${OPENAI_API_KEY}`,
                     'Content-Type': 'application/json',
                 },
-                body: JSON.stringify({
-                    model: model,
-                    input: text,
-                    voice: voice,
-                    speed: speed,
-                    response_format: responseFormat,
-                }),
+                body: JSON.stringify(params),
             });
             
             if (!openaiResponse.ok) {
                 const errorText = await openaiResponse.text();
-                console.error('OpenAI TTS error:', openaiResponse.status, errorText);
+                console.error('OpenAI Chat error:', openaiResponse.status, errorText.substring(0, 200));
                 res.writeHead(openaiResponse.status, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ error: 'OpenAI TTS failed: ' + errorText }));
+                res.end(JSON.stringify({ error: 'OpenAI Chat failed' }));
                 return;
             }
             
-            // Stream the audio response back to client
-            const audioData = await openaiResponse.arrayBuffer();
-            console.log(`OpenAI TTS success for user: ${user.id}, audio size: ${audioData.byteLength} bytes`);
+            // Stream SSE responses for streaming chat, buffer for non-streaming
+            if (params.stream && openaiResponse.body) {
+                res.writeHead(200, { 
+                    'Content-Type': 'text/event-stream',
+                    'Cache-Control': 'no-cache',
+                    'Transfer-Encoding': 'chunked',
+                });
+                const reader = openaiResponse.body.getReader();
+                try {
+                    while (true) {
+                        const { done, value } = await reader.read();
+                        if (done) break;
+                        res.write(Buffer.from(value));
+                    }
+                } catch (streamErr) {
+                    console.error('OpenAI Chat stream error:', streamErr.message);
+                } finally {
+                    res.end();
+                }
+                return;
+            }
             
-            // Content type based on format
-            const contentType = responseFormat === 'mp3' ? 'audio/mpeg' : 
-                               responseFormat === 'opus' ? 'audio/opus' :
-                               responseFormat === 'aac' ? 'audio/aac' :
-                               responseFormat === 'flac' ? 'audio/flac' : 'audio/mpeg';
-            
-            res.writeHead(200, { 
-                'Content-Type': contentType,
-                'Content-Length': audioData.byteLength,
-            });
-            res.end(Buffer.from(audioData));
+            const data = await openaiResponse.arrayBuffer();
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(Buffer.from(data));
             return;
         } catch (err) {
-            console.error('OpenAI TTS error:', err.message);
+            console.error('OpenAI Chat error:', err.message);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Internal server error' }));
+            return;
+        }
+    }
+    
+    // OpenAI Transcription proxy - proxies Whisper STT requests so API key stays on server
+    if (req.url === '/api/openai/transcriptions' && req.method === 'POST') {
+        try {
+            const authHeader = req.headers.authorization;
+            if (!authHeader || !authHeader.startsWith('Bearer ')) {
+                res.writeHead(401, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Unauthorized: No token provided' }));
+                return;
+            }
+            
+            const token = authHeader.substring(7);
+            const { data: { user }, error } = await supabase.auth.getUser(token);
+            
+            if (error || !user) {
+                console.log('OpenAI Transcription: Auth failed:', error?.message || 'Invalid token');
+                res.writeHead(401, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Unauthorized: Invalid token' }));
+                return;
+            }
+            
+            // Forward the raw multipart body to OpenAI (preserve content-type with boundary)
+            const chunks = [];
+            req.on('data', chunk => chunks.push(chunk));
+            await new Promise(resolve => req.on('end', resolve));
+            const bodyBuffer = Buffer.concat(chunks);
+            
+            console.log(`OpenAI Transcription request for user: ${user.id}, body size: ${bodyBuffer.length}`);
+            
+            const openaiResponse = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${OPENAI_API_KEY}`,
+                    'Content-Type': req.headers['content-type'],
+                },
+                body: bodyBuffer,
+            });
+            
+            if (!openaiResponse.ok) {
+                const errorText = await openaiResponse.text();
+                console.error('OpenAI Transcription error:', openaiResponse.status, errorText.substring(0, 200));
+                res.writeHead(openaiResponse.status, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'OpenAI Transcription failed' }));
+                return;
+            }
+            
+            const data = await openaiResponse.arrayBuffer();
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(Buffer.from(data));
+            return;
+        } catch (err) {
+            console.error('OpenAI Transcription error:', err.message);
             res.writeHead(500, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ error: 'Internal server error' }));
             return;
