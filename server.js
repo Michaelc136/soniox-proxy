@@ -10,6 +10,7 @@ const PORT = process.env.PORT || 8080;
 const SONIOX_API_KEY = process.env.SONIOX_API_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
+const DEEPL_AUTH_KEY = process.env.DEEPL_AUTH_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 
@@ -557,6 +558,110 @@ const server = createServer(async (req, res) => {
         }
     }
     
+    // DeepL Text Translation endpoint - translates text into one or more target languages
+    if (req.url === '/api/deepl/translate' && req.method === 'POST') {
+        try {
+            if (!DEEPL_AUTH_KEY) {
+                res.writeHead(503, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'DeepL translation not configured' }));
+                return;
+            }
+
+            const authHeader = req.headers.authorization;
+            if (!authHeader || !authHeader.startsWith('Bearer ')) {
+                res.writeHead(401, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Unauthorized: No token provided' }));
+                return;
+            }
+
+            const token = authHeader.substring(7);
+            const { data: { user }, error } = await supabase.auth.getUser(token);
+
+            if (error || !user) {
+                console.log('DeepL Translate: Auth failed:', error?.message || 'Invalid token');
+                res.writeHead(401, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Unauthorized: Invalid token' }));
+                return;
+            }
+
+            let body = '';
+            req.on('data', chunk => { body += chunk; });
+            await new Promise(resolve => req.on('end', resolve));
+
+            let params = {};
+            try { params = JSON.parse(body || '{}'); } catch (e) {}
+
+            const text = params.text;
+            const targetLanguages = params.target_languages; // array of lang codes
+            const sourceLanguage = params.source_language; // optional
+
+            if (!text || !targetLanguages || !Array.isArray(targetLanguages) || targetLanguages.length === 0) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Missing required fields: text (string), target_languages (array)' }));
+                return;
+            }
+
+            if (targetLanguages.length > 10) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Maximum 10 target languages per request' }));
+                return;
+            }
+
+            console.log(`DeepL Translate for user: ${user.id}, targets: [${targetLanguages.join(',')}], text length: ${text.length}`);
+
+            // DeepL requires one call per target language — fire them in parallel
+            const results = {};
+            const promises = targetLanguages.map(async (targetLang) => {
+                try {
+                    // DeepL uses uppercase codes, some need special mapping
+                    const deeplTarget = targetLang.toUpperCase();
+
+                    const deeplResponse = await fetch('https://api-free.deepl.com/v2/translate', {
+                        method: 'POST',
+                        headers: {
+                            'Authorization': `DeepL-Auth-Key ${DEEPL_AUTH_KEY}`,
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({
+                            text: [text],
+                            target_lang: deeplTarget,
+                            ...(sourceLanguage ? { source_lang: sourceLanguage.toUpperCase() } : {}),
+                        }),
+                    });
+
+                    if (!deeplResponse.ok) {
+                        const errorText = await deeplResponse.text();
+                        console.error(`DeepL error for ${targetLang}:`, deeplResponse.status, errorText);
+                        results[targetLang] = { error: `DeepL error: ${deeplResponse.status}` };
+                        return;
+                    }
+
+                    const data = await deeplResponse.json();
+                    results[targetLang] = {
+                        text: data.translations?.[0]?.text || '',
+                        detected_source: data.translations?.[0]?.detected_source_language?.toLowerCase(),
+                    };
+                } catch (langErr) {
+                    console.error(`DeepL error for ${targetLang}:`, langErr.message);
+                    results[targetLang] = { error: langErr.message };
+                }
+            });
+
+            await Promise.all(promises);
+
+            console.log(`DeepL Translate complete for user: ${user.id}, translated ${Object.keys(results).length} languages`);
+
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ translations: results }));
+            return;
+        } catch (err) {
+            console.error('DeepL Translate error:', err.message);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Internal server error' }));
+            return;
+        }
+    }
+
     res.writeHead(404);
     res.end('Not Found');
 });
@@ -573,6 +678,7 @@ console.log(`Supabase URL: ${SUPABASE_URL}`);
 console.log(`Soniox API Key: ${SONIOX_API_KEY ? '✓ configured' : '✗ missing'}`);
 console.log(`OpenAI API Key: ${OPENAI_API_KEY ? '✓ configured' : '✗ missing'}`);
 console.log(`Deepgram API Key: ${DEEPGRAM_API_KEY ? '✓ configured' : '✗ missing'}`);
+console.log(`DeepL Auth Key: ${DEEPL_AUTH_KEY ? '✓ configured' : '✗ missing'}`);
 
 wss.on('connection', async (clientWs, req) => {
     const connectionId = generateConnectionId();
@@ -925,6 +1031,7 @@ server.listen(PORT, () => {
     console.log(`   Health check: http://localhost:${PORT}/health`);
     console.log(`   OpenAI TTS: POST http://localhost:${PORT}/api/openai/tts`);
     console.log(`   Deepgram TTS: POST http://localhost:${PORT}/api/deepgram/tts`);
+    console.log(`   DeepL Translate: POST http://localhost:${PORT}/api/deepl/translate`);
     console.log(`   Soniox WebSocket: ws://localhost:${PORT}?token=YOUR_JWT_TOKEN`);
 });
 
