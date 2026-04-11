@@ -601,9 +601,9 @@ const server = createServer(async (req, res) => {
                 return;
             }
 
-            if (targetLanguages.length > 10) {
+            if (targetLanguages.length > 4) {
                 res.writeHead(400, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ error: 'Maximum 10 target languages per request' }));
+                res.end(JSON.stringify({ error: 'Maximum 4 target languages per request' }));
                 return;
             }
 
