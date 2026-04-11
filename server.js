@@ -609,12 +609,22 @@ const server = createServer(async (req, res) => {
 
             console.log(`DeepL Translate for user: ${user.id}, targets: [${targetLanguages.join(',')}], text length: ${text.length}`);
 
-            // DeepL requires one call per target language — fire them in parallel
+            // DeepL language code mapping — DeepL requires specific codes
+            const DEEPL_LANG_MAP = {
+                'en': 'EN-US', 'pt': 'PT-BR', 'zh': 'ZH-HANS',
+                'no': 'NB', // Norwegian Bokmål
+            };
+            // Languages DeepL Free doesn't support — skip silently
+            const DEEPL_UNSUPPORTED = new Set(['hi', 'ar', 'th', 'vi', 'he', 'ms', 'tl', 'sw', 'ht']);
+
             const results = {};
             const promises = targetLanguages.map(async (targetLang) => {
+                if (DEEPL_UNSUPPORTED.has(targetLang)) {
+                    results[targetLang] = { error: 'Language not supported by DeepL' };
+                    return;
+                }
                 try {
-                    // DeepL uses uppercase codes, some need special mapping
-                    const deeplTarget = targetLang.toUpperCase();
+                    const deeplTarget = DEEPL_LANG_MAP[targetLang] || targetLang.toUpperCase();
 
                     const deeplResponse = await fetch('https://api-free.deepl.com/v2/translate', {
                         method: 'POST',
@@ -625,7 +635,7 @@ const server = createServer(async (req, res) => {
                         body: JSON.stringify({
                             text: [text],
                             target_lang: deeplTarget,
-                            ...(sourceLanguage ? { source_lang: sourceLanguage.toUpperCase() } : {}),
+                            ...(sourceLanguage ? { source_lang: (DEEPL_LANG_MAP[sourceLanguage] || sourceLanguage.toUpperCase()).split('-')[0] } : {}),
                         }),
                     });
 
