@@ -774,6 +774,21 @@ wss.on('connection', async (clientWs, req) => {
         console.error(`[${connectionId}] Client WebSocket error:`, err.message);
         cleanupConnection(connectionId);
     });
+
+    // Keepalive: ping both legs every 20s so the load balancer / Soniox don't
+    // drop an otherwise-healthy connection during quiet moments (the cause of
+    // mid-session disconnects). Purely additive — the WebSocket spec requires
+    // peers to auto-respond to pings, so this never touches the audio/relay
+    // path. The interval is cleared in cleanupConnection.
+    connectionInfo.heartbeat = setInterval(() => {
+        try {
+            if (clientWs.readyState === WebSocket.OPEN) clientWs.ping();
+        } catch (e) { /* ignore */ }
+        try {
+            const c = connections.get(connectionId);
+            if (c && c.sonioxWs && c.sonioxWs.readyState === WebSocket.OPEN) c.sonioxWs.ping();
+        } catch (e) { /* ignore */ }
+    }, 20000);
 });
 
 function handleClientMessage(connectionId, data, isBinary) {
@@ -1005,9 +1020,15 @@ function connectToSoniox(connectionId, config) {
 function cleanupConnection(connectionId) {
     const conn = connections.get(connectionId);
     if (!conn) return;
-    
+
     console.log(`[${connectionId}] Cleaning up connection`);
-    
+
+    // Stop the keepalive heartbeat for this connection.
+    if (conn.heartbeat) {
+        clearInterval(conn.heartbeat);
+        conn.heartbeat = null;
+    }
+
     // Close Soniox connection
     if (conn.sonioxWs) {
         conn.sonioxWs.close();
