@@ -11,6 +11,12 @@ const SONIOX_API_KEY = process.env.SONIOX_API_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
 const DEEPL_AUTH_KEY = process.env.DEEPL_AUTH_KEY;
+// DeepL routes Free vs Pro by key suffix: Free keys end in ":fx" and use the
+// api-free host; Pro keys have no suffix and use the api host. Auto-detect so a
+// plan change only needs a new key, not a code edit.
+const DEEPL_API_HOST = (DEEPL_AUTH_KEY && DEEPL_AUTH_KEY.endsWith(':fx'))
+  ? 'https://api-free.deepl.com'
+  : 'https://api.deepl.com';
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 
@@ -626,7 +632,7 @@ const server = createServer(async (req, res) => {
                 try {
                     const deeplTarget = DEEPL_LANG_MAP[targetLang] || targetLang.toUpperCase();
 
-                    const deeplResponse = await fetch('https://api-free.deepl.com/v2/translate', {
+                    const deeplResponse = await fetch(`${DEEPL_API_HOST}/v2/translate`, {
                         method: 'POST',
                         headers: {
                             'Authorization': `DeepL-Auth-Key ${DEEPL_AUTH_KEY}`,
@@ -688,7 +694,7 @@ console.log(`Supabase URL: ${SUPABASE_URL}`);
 console.log(`Soniox API Key: ${SONIOX_API_KEY ? '✓ configured' : '✗ missing'}`);
 console.log(`OpenAI API Key: ${OPENAI_API_KEY ? '✓ configured' : '✗ missing'}`);
 console.log(`Deepgram API Key: ${DEEPGRAM_API_KEY ? '✓ configured' : '✗ missing'}`);
-console.log(`DeepL Auth Key: ${DEEPL_AUTH_KEY ? '✓ configured' : '✗ missing'}`);
+console.log(`DeepL Auth Key: ${DEEPL_AUTH_KEY ? '✓ configured' : '✗ missing'} (${DEEPL_API_HOST})`);
 
 wss.on('connection', async (clientWs, req) => {
     const connectionId = generateConnectionId();
