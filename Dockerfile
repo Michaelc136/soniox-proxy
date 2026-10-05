@@ -11,8 +11,8 @@ COPY package*.json ./
 # Install dependencies (use npm install if no lock file, ci if available)
 RUN npm ci --omit=dev 2>/dev/null || npm install --omit=dev
 
-# Copy source code
-COPY server.js ./
+# Copy source code (the relay modules ship with the server)
+COPY server.js upstream.js relay.js ./
 
 # Expose port (DigitalOcean will set PORT env var)
 EXPOSE 8080

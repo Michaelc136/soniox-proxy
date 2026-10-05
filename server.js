@@ -2,6 +2,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { createServer } from 'http';
 import { createClient } from '@supabase/supabase-js';
 import { config } from 'dotenv';
+import { Relay, readRelayConfig, describeRelayConfig } from './relay.js';
 
 config();
 
@@ -39,6 +40,10 @@ if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
     console.error('ERROR: SUPABASE_URL and SUPABASE_ANON_KEY environment variables are required');
     process.exit(1);
 }
+
+// Soniox relay behavior (keepalive, stall watchdog, rotation, re-dial), all
+// from SONIOX_* env vars with the defaults in docs/reliability-2026-10.md.
+const RELAY_CONFIG = readRelayConfig(process.env);
 
 // Initialize Supabase client for JWT verification
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
@@ -695,6 +700,7 @@ console.log(`Soniox API Key: ${SONIOX_API_KEY ? '✓ configured' : '✗ missing'
 console.log(`OpenAI API Key: ${OPENAI_API_KEY ? '✓ configured' : '✗ missing'}`);
 console.log(`Deepgram API Key: ${DEEPGRAM_API_KEY ? '✓ configured' : '✗ missing'}`);
 console.log(`DeepL Auth Key: ${DEEPL_AUTH_KEY ? '✓ configured' : '✗ missing'} (${DEEPL_API_HOST})`);
+console.log(`Soniox relay: ${describeRelayConfig(RELAY_CONFIG)}`);
 
 wss.on('connection', async (clientWs, req) => {
     const connectionId = generateConnectionId();
@@ -747,15 +753,19 @@ wss.on('connection', async (clientWs, req) => {
         return;
     }
     
-    // Store connection info
-    const connectionInfo = {
+    // One relay per client: it owns the Soniox stream(s), the audio path,
+    // keepalive, the stall watchdog, rotation and re-dial (see relay.js).
+    const relay = new Relay({
         clientWs,
-        sonioxWs: null,
         connectionId,
-        isReady: false
-    };
-    connections.set(connectionId, connectionInfo);
-    
+        apiKey: SONIOX_API_KEY,
+        config: RELAY_CONFIG,
+        log: console.log,
+        onClosed: () => connections.delete(connectionId),
+    });
+    connections.set(connectionId, relay);
+    relay.attach();
+
     // Send immediate acknowledgment so client knows auth passed and server is ready
     console.log(`[${connectionId}] Auth complete, sending auth_success to client`);
     sendToClient(clientWs, {
@@ -763,288 +773,13 @@ wss.on('connection', async (clientWs, req) => {
         message: 'Authenticated, ready for start message',
         connectionId: connectionId
     });
-    
-    // Handle messages from client
-    clientWs.on('message', (data, isBinary) => {
-        console.log(`[${connectionId}] Received message: isBinary=${isBinary}, type=${typeof data}, length=${data?.length || 0}`);
-        handleClientMessage(connectionId, data, isBinary);
-    });
-    
-    // Handle client disconnect
-    clientWs.on('close', (code, reason) => {
-        console.log(`[${connectionId}] Client disconnected: ${code} ${reason?.toString() || ''}`);
-        cleanupConnection(connectionId);
-    });
-    
-    clientWs.on('error', (err) => {
-        console.error(`[${connectionId}] Client WebSocket error:`, err.message);
-        cleanupConnection(connectionId);
-    });
-
-    // Keepalive: ping both legs every 20s so the load balancer / Soniox don't
-    // drop an otherwise-healthy connection during quiet moments (the cause of
-    // mid-session disconnects). Purely additive — the WebSocket spec requires
-    // peers to auto-respond to pings, so this never touches the audio/relay
-    // path. The interval is cleared in cleanupConnection.
-    connectionInfo.heartbeat = setInterval(() => {
-        try {
-            if (clientWs.readyState === WebSocket.OPEN) clientWs.ping();
-        } catch (e) { /* ignore */ }
-        try {
-            const c = connections.get(connectionId);
-            if (c && c.sonioxWs && c.sonioxWs.readyState === WebSocket.OPEN) c.sonioxWs.ping();
-        } catch (e) { /* ignore */ }
-    }, 20000);
 });
 
-function handleClientMessage(connectionId, data, isBinary) {
-    const conn = connections.get(connectionId);
-    if (!conn) {
-        console.log(`[${connectionId}] No connection found for message`);
-        return;
-    }
-    
-    // Convert data to string for inspection
-    const dataStr = data.toString();
-    
-    // Check if it looks like JSON (starts with { or [)
-    const looksLikeJson = dataStr.startsWith('{') || dataStr.startsWith('[');
-    
-    // If binary audio data (not JSON), forward to Soniox
-    if (isBinary && !looksLikeJson) {
-        if (conn.sonioxWs && conn.sonioxWs.readyState === WebSocket.OPEN) {
-            conn.sonioxWs.send(data);
-            // Don't log every audio packet to reduce noise
-        } else {
-            // Silently drop audio if Soniox not connected yet
-        }
-        return;
-    }
-    
-    // Parse JSON message
-    let message;
-    try {
-        message = JSON.parse(dataStr);
-        console.log(`[${connectionId}] Parsed JSON message:`, JSON.stringify(message).substring(0, 200));
-    } catch (err) {
-        console.log(`[${connectionId}] Failed to parse JSON: ${err.message}`);
-        console.log(`[${connectionId}] Raw data (first 200 chars):`, dataStr.substring(0, 200));
-        return;
-    }
-    
-    // Handle ping/keepalive
-    if (message.type === 'ping') {
-        console.log(`[${connectionId}] Received ping, sending pong`);
-        sendToClient(conn.clientWs, {
-            type: 'pong',
-            ref: message.ref || 0,
-            timestamp: Date.now()
-        });
-        return;
-    }
-    
-    // Handle start action - connect to Soniox
-    if (message.action === 'start') {
-        console.log(`[${connectionId}] ✅ Received START action - connecting to Soniox...`);
-        const configToUse = message.config || message;
-        const translation = configToUse.translation || {};
-        console.log(`[${connectionId}] Config structure:`, JSON.stringify({
-            hasTranslation: !!configToUse.translation,
-            translation: translation,
-            targetLang: translation.target_language,
-            sourceLang: translation.source_language
-        }));
-        connectToSoniox(connectionId, configToUse);
-        return;
-    }
-    
-    // Handle finalize message - flush pending tokens before language switch
-    if (message.type === 'finalize') {
-        console.log(`[${connectionId}] 📝 Received FINALIZE - flushing pending tokens...`);
-        if (conn.sonioxWs && conn.sonioxWs.readyState === WebSocket.OPEN) {
-            // Forward finalize message to Soniox
-            conn.sonioxWs.send(JSON.stringify(message));
-            console.log(`[${connectionId}] Finalize message forwarded to Soniox`);
-        } else {
-            console.log(`[${connectionId}] Cannot finalize - Soniox not connected`);
-        }
-        return;
-    }
-    
-    // Forward other messages to Soniox
-    console.log(`[${connectionId}] Forwarding message to Soniox:`, JSON.stringify(message).substring(0, 100));
-    if (conn.sonioxWs && conn.sonioxWs.readyState === WebSocket.OPEN) {
-        conn.sonioxWs.send(JSON.stringify(message));
-    } else {
-        console.log(`[${connectionId}] Cannot forward - Soniox not connected (state: ${conn.sonioxWs?.readyState})`);
-    }
-}
-
-function connectToSoniox(connectionId, config) {
-    const conn = connections.get(connectionId);
-    if (!conn) {
-        console.log(`[${connectionId}] connectToSoniox: No connection found!`);
-        return;
-    }
-    
-    // Close existing Soniox connection if any
-    if (conn.sonioxWs) {
-        console.log(`[${connectionId}] Closing existing Soniox connection`);
-        conn.sonioxWs.close();
-        conn.sonioxWs = null;
-    }
-    
-    console.log(`[${connectionId}] 🔗 Connecting to Soniox WebSocket...`);
-    console.log(`[${connectionId}] Client config:`, JSON.stringify(config).substring(0, 300));
-    
-    // Connect to Soniox (no auth header - API key goes in config JSON per docs)
-    const sonioxWs = new WebSocket('wss://stt-rt.soniox.com/transcribe-websocket');
-    
-    sonioxWs.on('open', () => {
-        console.log(`[${connectionId}] Connected to Soniox`);
-        conn.sonioxWs = sonioxWs;
-        
-        // Build Soniox config - API key must be in the JSON config per Soniox docs
-        const sonioxConfig = {
-            api_key: SONIOX_API_KEY,
-            model: config.model || 'stt-rt-preview',
-            audio_format: config.audio_format || 'pcm_s16le',
-            sample_rate: config.sample_rate || 16000,
-            num_channels: config.num_channels || 1,
-            include_nonfinal: config.include_nonfinal !== false,
-            language_hints: config.language_hints || ['en'],
-            // Enable endpoint detection to finalize tokens on speech pauses (reduces hanging)
-            enable_endpoint_detection: config.enable_endpoint_detection !== false,
-            // Reduce max non-final duration for faster translation output (default is ~4000-6000ms)
-            max_non_final_tokens_duration_ms: config.max_non_final_tokens_duration_ms || 4000
-        };
-        
-        // Add translation config if present
-        if (config.translation) {
-            const targetLang = config.translation.target_language;
-            const sourceLang = config.translation.source_language;
-            
-            if (!targetLang) {
-                console.error(`[${connectionId}] ⚠️ Translation config missing target_language!`, JSON.stringify(config.translation));
-                console.error(`[${connectionId}] Full config received:`, JSON.stringify(config).substring(0, 500));
-            } else {
-                console.log(`[${connectionId}] ✅ Translation config - source: ${sourceLang || 'auto'}, target: ${targetLang}`);
-                
-                sonioxConfig.translation = {
-                    type: config.translation.type || 'one_way',
-                    target_language: targetLang
-                };
-                // Add source_language if provided (required for translation to work)
-                if (sourceLang) {
-                    sonioxConfig.translation.source_language = sourceLang;
-                }
-                
-                console.log(`[${connectionId}] Final Soniox translation config:`, JSON.stringify(sonioxConfig.translation));
-            }
-        } else {
-            console.log(`[${connectionId}] ⚠️ No translation config provided in config object`);
-            console.log(`[${connectionId}] Config keys:`, Object.keys(config));
-        }
-        
-        // Send config to Soniox
-        sonioxWs.send(JSON.stringify(sonioxConfig));
-        console.log(`[${connectionId}] Sent config to Soniox:`, JSON.stringify(sonioxConfig).substring(0, 300));
-        
-        // Don't send proxy_ready yet - wait for Soniox to acknowledge
-        // We'll send it after receiving the first message from Soniox
-    });
-    
-    sonioxWs.on('message', (data) => {
-        const dataStr = data.toString();
-        console.log(`[${connectionId}] Soniox message:`, dataStr.substring(0, 300));
-        
-        // If this is the first message (status/ack), send proxy_ready
-        if (!conn.isReady) {
-            conn.isReady = true;
-            console.log(`[${connectionId}] Soniox acknowledged config, sending proxy_ready to client`);
-            sendToClient(conn.clientWs, {
-                type: 'proxy_ready',
-                connection_id: connectionId
-            });
-        }
-        
-        // Forward Soniox response to client
-        if (conn.clientWs && conn.clientWs.readyState === WebSocket.OPEN) {
-            conn.clientWs.send(dataStr);
-        }
-    });
-    
-    sonioxWs.on('close', (code, reason) => {
-        const reasonStr = reason ? reason.toString() : 'No reason provided';
-        console.log(`[${connectionId}] Soniox connection closed: code=${code}, reason="${reasonStr}"`);
-        
-        // Log if this happened before Soniox acknowledged config
-        if (!conn.isReady) {
-            console.error(`[${connectionId}] ⚠️ Soniox closed BEFORE acknowledging config - likely invalid API key or config`);
-        }
-        
-        conn.sonioxWs = null;
-        conn.isReady = false;
-        
-        // Notify client
-        if (conn.clientWs && conn.clientWs.readyState === WebSocket.OPEN) {
-            sendToClient(conn.clientWs, {
-                type: 'error',
-                message: `Soniox connection closed: ${reasonStr || 'Unknown reason'}`,
-                code: code
-            });
-        }
-    });
-    
-    sonioxWs.on('error', (err) => {
-        console.error(`[${connectionId}] Soniox error:`, err.message);
-        conn.sonioxWs = null;
-        conn.isReady = false;
-        
-        // Notify client
-        if (conn.clientWs && conn.clientWs.readyState === WebSocket.OPEN) {
-            sendToClient(conn.clientWs, {
-                type: 'error',
-                message: 'Soniox connection error: ' + err.message
-            });
-        }
-    });
-    
-    // Timeout for Soniox connection
-    setTimeout(() => {
-        if (sonioxWs.readyState !== WebSocket.OPEN) {
-            console.log(`[${connectionId}] Soniox connection timeout`);
-            sonioxWs.close();
-            sendToClient(conn.clientWs, {
-                type: 'error',
-                message: 'Soniox connection timeout'
-            });
-        }
-    }, 10000);
-}
-
 function cleanupConnection(connectionId) {
-    const conn = connections.get(connectionId);
-    if (!conn) return;
-
+    const relay = connections.get(connectionId);
+    if (!relay) return;
     console.log(`[${connectionId}] Cleaning up connection`);
-
-    // Stop the keepalive heartbeat for this connection.
-    if (conn.heartbeat) {
-        clearInterval(conn.heartbeat);
-        conn.heartbeat = null;
-    }
-
-    // Close Soniox connection
-    if (conn.sonioxWs) {
-        conn.sonioxWs.close();
-    }
-    
-    // Close client connection
-    if (conn.clientWs && conn.clientWs.readyState !== WebSocket.CLOSED) {
-        conn.clientWs.close();
-    }
-    
+    relay.destroy('server cleanup');
     connections.delete(connectionId);
 }
 
