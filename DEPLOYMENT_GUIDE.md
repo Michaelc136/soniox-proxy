@@ -75,6 +75,47 @@ private let digitalOceanWebSocketEndpoint = "wss://soniox-proxy-abc123.ondigital
    - `✅ proxy_ready received from DigitalOcean!`
    - `✅ DigitalOcean proxy connected to Soniox - ready for audio!`
 
+## Soniox relay environment variables (reliability, 2026-10)
+
+All optional. Defaults apply when a variable is unset. Flags accept `on`/`off`,
+`true`/`false`, `1`/`0`. Details and rationale: `docs/reliability-2026-10.md`.
+Run the suite with `npm test` (uses the mock in `test/mock-soniox.js`).
+
+| Variable | Default | What it does |
+|---|---|---|
+| `SONIOX_WS_URL` | `wss://stt-rt.soniox.com/transcribe-websocket` | Upstream endpoint. Tests point it at the mock. |
+| `SONIOX_LANG_ID` | `on` | Sends `enable_language_identification: true` so tokens carry `language`. |
+| `SONIOX_STRICT_HINTS` | `on` | Sends `language_hints_strict: true` when the client sent exactly one hint. |
+| `SONIOX_KEEPALIVE_MS` | `10000` | After this long without audio, send `{"type":"keepalive"}` at this interval until audio resumes. |
+| `SONIOX_STALL_WATCHDOG` | `on` | Detect "finals but no translation" and recycle the stream (translation sessions only). |
+| `SONIOX_STALL_SEGMENTS` | `6` | Consecutive untranslated segments before a stall is declared. |
+| `SONIOX_STALL_QUIET_MS` | `20000` | Minimum time since the last translation token before a stall is declared. |
+| `SONIOX_SEGMENT_GAP_MS` | `700` | Without an `<end>` token, a run of finals followed by this much silence closes a segment. |
+| `SONIOX_RECYCLE_MIN_INTERVAL_MS` | `120000` | At most one stall recycle per client in this window. |
+| `SONIOX_RECYCLE_MAX` | `3` | Stall recycles allowed per `SONIOX_RECYCLE_WINDOW_MS`; past it, `translation_unavailable` is sent once. |
+| `SONIOX_RECYCLE_WINDOW_MS` | `600000` | Window for `SONIOX_RECYCLE_MAX`. |
+| `SONIOX_ROTATION` | `on` | Roll to a fresh upstream before the fixed 300 minute cap. |
+| `SONIOX_ROTATE_SOFT_MIN` | `270` | Minutes (max of audio and wall) at which the replacement is pre-dialed and the switch waits for the next endpoint. |
+| `SONIOX_ROTATE_HARD_MIN` | `290` | Minutes at which the switch happens immediately. |
+| `SONIOX_ROTATE_BACKSTOP_MIN` | `292` | Wall-clock timer that forces the switch. |
+| `SONIOX_ROTATE_QUIET_MS` | `600` | After the soft mark, switch after this long with no tokens if no endpoint arrives. |
+| `SONIOX_FINALIZE_TAIL_MS` | `1500` | How long the old stream's final tail is forwarded after `finalize` (ends early on `<fin>`). |
+| `SONIOX_END_GRACE_MS` | `500` | Wait for `finished` after the empty end frame before closing the old stream. |
+| `SONIOX_AUDIO_BUFFER_MS` | `15000` | Audio buffered while no upstream can take it (switch or re-dial); oldest frames drop past the cap. |
+| `SONIOX_REDIAL_DELAYS_MS` | `1000,3000` | Re-dial attempts after an upstream loss. A missed rotation (`max_duration_reached`) dials immediately first. |
+| `SONIOX_ACK_TIMEOUT_MS` | `10000` | Connect plus start ack deadline per dial. |
+| `SONIOX_OVERLAP_WARN_MS` | `3000` | Log when two upstreams overlap longer than this during a switch. |
+| `SONIOX_SUMMARY_MS` | `60000` | Per-stream counter summary log interval. |
+| `SONIOX_HEARTBEAT_MS` | `20000` | WebSocket ping interval on both legs. |
+| `SONIOX_ROTATION_TICK_MS` | `1000` | How often rotation marks are checked when no audio is flowing. |
+
+Client-facing additions (both clients ignore unknown frame types):
+`{"type":"proxy_notice","event":"translation_stalled"}`, `stream_recycled`,
+`stream_rotated` (with `minutes`), `translation_unavailable`. `proxy_ready` is
+sent exactly once per client connection. On an unrecoverable upstream failure
+the proxy sends `{"type":"error","code":..,"message":..}` and closes the client
+socket with 1011 so the client's own reconnect runs.
+
 ## 🗑️ Clean Up AWS Resources
 
 After confirming DigitalOcean works, delete these AWS resources:
