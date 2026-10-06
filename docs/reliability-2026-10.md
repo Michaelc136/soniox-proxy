@@ -111,9 +111,13 @@ surgical edits in server.js so the WebSocket handling delegates to relay.js. Kee
    new upstream with the same config, wait for its ack, then switch audio to it, send
    `{"type":"finalize"}` to the old, forward its final tail (strip `<fin>`) for up to 1.5 s, send
    the empty frame, close it. Then `{"type":"proxy_notice","event":"stream_recycled"}`. Cap: at
-   most one recycle per 120 s per client; after 3 recycles in 10 minutes stop recycling and send
-   `{"type":"proxy_notice","event":"translation_unavailable"}` once. Never send a second
-   `proxy_ready`.
+   most one recycle per 120 s per client (SONIOX_RECYCLE_MIN_INTERVAL_MS); after 3 recycles in
+   10 minutes (SONIOX_RECYCLE_MAX in SONIOX_RECYCLE_WINDOW_MS) enter SLOW MODE: the watchdog
+   stays armed, the minimum interval between recycles becomes SONIOX_STALL_SLOW_INTERVAL_MS
+   (default 600000, 10 minutes), and `[stall] slow mode` is logged once. Leave slow mode (back to
+   the normal interval and a fresh window) as soon as a translation token arrives on the current
+   stream. The stall path never sends `translation_unavailable` (see the 2026-10-05 slow mode
+   note below). Never send a second `proxy_ready`.
 5. Rotation before the cap (env SONIOX_ROTATION default on, SONIOX_ROTATE_SOFT_MIN=270,
    SONIOX_ROTATE_HARD_MIN=290, SONIOX_ROTATE_BACKSTOP_MIN=292). Measure both audio minutes
    forwarded and wall minutes since the upstream opened; use whichever is larger. At the soft
@@ -149,7 +153,9 @@ config carries `language_hints_strict` only with one hint and drops `source_lang
 redacted in logs; `enable_language_identification` set; stall detected after 6 segments and not
 before; recycle produces exactly one `proxy_ready` total, a `translation_stalled` then
 `stream_recycled` notice, continuous audio delivery (count bytes received by mock streams equals
-bytes sent), `<fin>` never reaches the client; recycle cap and `translation_unavailable`; rotation
+bytes sent), `<fin>` never reaches the client; recycle cap enters slow mode (no recycle inside the
+slow interval, exactly one after it, never `translation_unavailable`, a translation token restores
+the normal interval); rotation
 at tiny env thresholds (e.g. SONIOX_ROTATE_SOFT_MIN=0.02) with buffered audio flushed in order and
 old stream finalized and ended; max_duration_reached triggers immediate recycle; upstream drop
 re-dials; re-dial failure closes the client with 1011; keepalive sent after 10 s without audio;
@@ -185,7 +191,8 @@ table across the six runs. Total audio about 100 minutes; cost under a dollar.
 In `useSonioxConnection.ts`: handle incoming `{"type":"proxy_notice"}` messages. Map
 `translation_stalled` -> a transient status string "Translation reconnecting", `stream_recycled`
 and `stream_rotated` -> "Connection renewed", `translation_unavailable` -> a persistent warning
-"Translation unavailable, restart the session". Surface them through whatever status surface the
+"Translation unavailable, restart the session" (keep the handler; the event is reserved and the
+proxy does not send it today, see the slow mode note). Surface them through whatever status surface the
 hook already exposes to the UI (read the hook: there is a connection status like
 Connecting/Listening/Live and a banner/error path). Do not change the audio path, reconnect
 logic, or StudioEngine.tsx. Add a vitest for the pure mapping. `npx tsc --noEmit` clean.
@@ -254,3 +261,32 @@ Confirmed findings from the adversarial review of the branch, each with a regres
 
 Not done, noted for later: a process-wide count of open upstream sockets so a soft pre-dial is
 skipped rather than attempted when the platform is near the 10-concurrent limit.
+
+## Slow mode replaces the recycle hard stop (2026-10-05, after the live smoke runs)
+
+Live smoke runs through the production proxy showed that when the speaker is genuinely talking
+or singing in the TARGET language, Soniox returns final tokens with translation_status `none` and
+`language` equal to the target. The watchdog counts those as untranslated segments, and must keep
+doing so, because a real stall (English mislabeled as the target) looks identical. The old cap
+then disarmed the watchdog for the rest of the connection after SONIOX_RECYCLE_MAX recycles in
+SONIOX_RECYCLE_WINDOW_MS and sent `translation_unavailable`, which (a) removed protection against
+a real stall later in the same session and (b) would have shown operators a false "Translation
+unavailable, restart the session" banner during Spanish worship singing once the clients ship.
+
+Change (relay.js, declareStall / onTranslationToken, with the regression test in
+`test/stall.test.js`):
+
+- When the cap is reached the relay enters slow mode instead of stopping: the watchdog stays
+  armed, the minimum interval between recycles rises to SONIOX_STALL_SLOW_INTERVAL_MS (default
+  600000, 10 minutes), and `[stall] slow mode` is logged once. Stalls declared inside the slow
+  interval are logged as `recycle suppressed (slow mode)`.
+- Slow mode ends as soon as a translation token arrives on the current stream: back to
+  SONIOX_RECYCLE_MIN_INTERVAL_MS and a fresh cap window (`recycleTimes` cleared, `lastRecycleAt`
+  kept so the normal interval still counts from the last real recycle). Logged as
+  `[stall] normal mode`.
+- The stall path never sends `translation_unavailable`. The event stays in the notice contract
+  (`PROXY_NOTICE_EVENTS` in relay.js, the DEPLOYMENT_GUIDE table) as RESERVED for a future "the
+  engine cannot be reached" condition. No other path in the tree sent it before this change, so
+  nothing else was touched.
+- `translation_stalled` and `stream_recycled` are unchanged, including the rule that
+  `translation_stalled` is sent only when a recycle actually follows.

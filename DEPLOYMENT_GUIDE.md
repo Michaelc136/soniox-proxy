@@ -92,9 +92,10 @@ Run the suite with `npm test` (uses the mock in `test/mock-soniox.js`).
 | `SONIOX_STALL_QUIET_MS` | `20000` | Minimum time since the last translation token before a stall is declared. |
 | `SONIOX_STALL_COUNT_NONE` | `on` | Count finals tagged `translation_status: none` (speech Soniox judged outside the pair, so no translation follows) as untranslated segments. |
 | `SONIOX_SEGMENT_GAP_MS` | `700` | Without an `<end>` token, a run of finals followed by this much silence closes a segment. |
-| `SONIOX_RECYCLE_MIN_INTERVAL_MS` | `120000` | At most one stall recycle per client in this window. |
-| `SONIOX_RECYCLE_MAX` | `3` | Stall recycles allowed per `SONIOX_RECYCLE_WINDOW_MS`; past it, `translation_unavailable` is sent once. |
+| `SONIOX_RECYCLE_MIN_INTERVAL_MS` | `120000` | At most one stall recycle per client in this window (normal mode). |
+| `SONIOX_RECYCLE_MAX` | `3` | Stall recycles allowed per `SONIOX_RECYCLE_WINDOW_MS`; past it the watchdog enters slow mode (see `SONIOX_STALL_SLOW_INTERVAL_MS`). Nothing is sent to the client for the cap itself. |
 | `SONIOX_RECYCLE_WINDOW_MS` | `600000` | Window for `SONIOX_RECYCLE_MAX`. |
+| `SONIOX_STALL_SLOW_INTERVAL_MS` | `600000` | Slow mode: once `SONIOX_RECYCLE_MAX` recycles have happened inside the window, the watchdog stays armed but recycles no more often than this (10 minutes). Slow mode ends, with a fresh window, as soon as a translation token arrives on the current stream. Speech or singing in the target language looks like a stall to the watchdog (finals tagged `none`, no translation), so this is what stops a Spanish worship set from recycling every two minutes while a real stall later in the same session is still caught. Logged once as `[stall] slow mode`. |
 | `SONIOX_ROTATION` | `on` | Roll to a fresh upstream before the fixed 300 minute cap. |
 | `SONIOX_ROTATE_SOFT_MIN` | `270` | Minutes (max of audio and wall) at which the replacement is pre-dialed and the switch waits for the next endpoint. |
 | `SONIOX_ROTATE_HARD_MIN` | `290` | Minutes at which the switch happens immediately. |
@@ -114,8 +115,12 @@ Run the suite with `npm test` (uses the mock in `test/mock-soniox.js`).
 | `SONIOX_ROTATION_TICK_MS` | `1000` | How often rotation marks are checked when no audio is flowing. |
 
 Client-facing additions (both clients ignore unknown frame types):
-`{"type":"proxy_notice","event":"translation_stalled"}`, `stream_recycled`,
-`stream_rotated` (with `minutes`), `translation_unavailable`. `proxy_ready` is
+`{"type":"proxy_notice","event":"translation_stalled"}` (sent only when a
+recycle follows), `stream_recycled`, `stream_rotated` (with `minutes`).
+`translation_unavailable` is part of the notice contract but RESERVED for a
+future "the engine cannot be reached" condition: no proxy path sends it today,
+and the stall watchdog in particular never does (its recycle cap switches to
+slow mode instead). Clients may keep a handler for it. `proxy_ready` is
 sent exactly once per client connection. On an unrecoverable upstream failure
 the proxy sends `{"type":"error","code":..,"message":..}` and closes the client
 socket with 1011 so the client's own reconnect runs. A pre-dialed rotation

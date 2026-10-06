@@ -132,27 +132,85 @@ test('recycle: one proxy_ready, translation_stalled then stream_recycled, contin
     }
 });
 
-test('recycle cap: after recycleMax recycles in the window, translation_unavailable is sent once and recycling stops', async () => {
-    const env = await setup({ stallSegments: 2, recycleMax: 3, recycleWindowMs: 60000, recycleMinIntervalMs: 0 }, { stallAfterFrames: 0 });
+// Speech or singing in the TARGET language comes back as finals tagged
+// translation_status none with language equal to the target, which is the
+// same shape as a real stall (English mislabeled as the target). The cap
+// therefore must not disarm the watchdog or tell the operator translation is
+// unavailable: it switches to a slow mode that keeps recycling, just rarely,
+// and drops back to normal the moment a translation token arrives.
+test('recycle cap: after recycleMax recycles in the window the watchdog enters slow mode, never sends translation_unavailable, and a translation token restores the normal interval', async () => {
+    const slowMs = 2500;
+    const env = await setup({ stallSegments: 2, recycleMax: 3, recycleWindowMs: 60000, recycleMinIntervalMs: 0, stallSlowIntervalMs: slowMs }, { stallAfterFrames: 0 });
+    let pumping = true;
     try {
         const client = await connectClient(env.host.url);
         await client.start();
-        const pumping = client.pump(120, 10);
-        await waitUntil(() => client.notices().filter((n) => n === 'translation_unavailable').length === 1, 4000, 'translation_unavailable not sent');
-        await pumping;
+        const relay = env.host.relays[0];
+        // Open-ended pump (client.pump needs a frame count up front); stops on
+        // request or when the socket is no longer open.
+        const pumpLoop = (async () => { while (pumping && client.ws.readyState === 1) { client.sendAudio(); await sleep(10); } })();
+
+        // Three recycles come as fast as the min interval (0) allows; the
+        // fourth stall meets the cap and enters slow mode.
+        await waitUntil(() => relay.slowMode === true, 4000, 'slow mode not entered');
+        const thirdRecycleAt = relay.lastRecycleAt;
+        assert.equal(env.mock.streams.length, 4, 'three recycles happened before slow mode');
+        assert.equal(relay.watchdogActive, true, 'the watchdog stays armed in slow mode');
+        assert.equal(env.host.logs.filter((l) => l.startsWith('[stall] slow mode')).length, 1, '[stall] slow mode logged once');
+
+        // Inside the slow interval stalls keep being declared and suppressed,
+        // and no recycle happens.
+        await sleep(Math.round(slowMs * 0.5));
+        assert.equal(env.mock.streams.length, 4, 'no recycle inside the slow interval');
+        assert.ok(env.host.logs.some((l) => l.includes('recycle suppressed') && l.includes('slow mode')), 'stalls are still declared and suppressed');
+        assert.equal(env.host.logs.filter((l) => l.startsWith('[stall] slow mode')).length, 1, 'slow mode is logged only on entry');
+
+        // Exactly one recycle once the slow interval has passed, then quiet again.
+        await env.mock.waitForStreams(5, slowMs + 2000);
+        assert.ok(relay.lastRecycleAt - thirdRecycleAt >= slowMs, `slow recycle waited ${relay.lastRecycleAt - thirdRecycleAt} ms, expected >= ${slowMs}`);
+        const fourthRecycleAt = relay.lastRecycleAt;
+        assert.equal(relay.slowMode, true, 'still slow: the replacement stalls too');
+        await sleep(800);
+        assert.equal(env.mock.streams.length, 5, 'only one recycle per slow interval');
+
+        // A translation token on the current stream ends slow mode. The next
+        // stall then recycles on the normal interval, well inside what would
+        // have been the slow interval.
+        const live = env.mock.streams[4];
+        live.behavior.stallAfterFrames = null;
+        await waitUntil(() => relay.slowMode === false, 2000, 'slow mode not left after a translation token');
+        assert.deepEqual(relay.recycleTimes, [], 'fresh recycle window');
+        assert.ok(env.host.logs.some((l) => l.startsWith('[stall] normal mode')), 'leaving slow mode is logged');
+        await sleep(100);
+        live.behavior.stallAfterFrames = 0;
+        await env.mock.waitForStreams(6, 2000);
+        assert.ok(relay.lastRecycleAt - fourthRecycleAt < slowMs, `normal interval restored: recycled ${relay.lastRecycleAt - fourthRecycleAt} ms after the slow recycle`);
+
+        pumping = false;
+        await pumpLoop;
         await sleep(150);
         const notices = client.notices();
-        assert.equal(notices.filter((n) => n === 'translation_stalled').length, 3, 'three recycles');
-        assert.equal(notices.filter((n) => n === 'stream_recycled').length, 3);
-        assert.equal(notices.filter((n) => n === 'translation_unavailable').length, 1, 'sent once');
-        assert.equal(env.mock.streams.length, 4, 'no further recycles after the cap');
+        assert.equal(notices.includes('translation_unavailable'), false, 'translation_unavailable is never sent from the stall path');
+        assert.equal(notices.filter((n) => n === 'translation_stalled').length, 5, 'five recycles in total');
+        assert.equal(notices.filter((n) => n === 'stream_recycled').length, 5, 'every translation_stalled was followed by a recycle');
+        assert.equal(env.mock.streams.length, 6);
         assert.equal(client.ofType('proxy_ready').length, 1);
         assert.equal(client.closeCode, null, 'captions keep flowing; the client stays connected');
         assert.equal(env.mock.totalAudioBytes(), client.sentAudioBytes());
         client.close();
     } finally {
+        pumping = false;
         await env.teardown();
     }
+});
+
+test('translation_unavailable is reserved: part of the notice contract, never sent by any relay path', async () => {
+    const { PROXY_NOTICE_EVENTS } = await import('../relay.js');
+    assert.ok(PROXY_NOTICE_EVENTS.includes('translation_unavailable'), 'still defined for the clients');
+    const { readFileSync } = await import('node:fs');
+    const source = readFileSync(new URL('../relay.js', import.meta.url), 'utf8');
+    assert.equal(source.includes("sendNotice('translation_unavailable'"), false, 'no code path sends it');
+    assert.equal(source.includes('sendNotice("translation_unavailable"'), false);
 });
 
 // Soniox tags speech it judges outside the configured pair translation_status

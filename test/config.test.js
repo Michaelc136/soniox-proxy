@@ -95,6 +95,7 @@ test('readRelayConfig defaults match the spec', () => {
     assert.equal(c.recycleMinIntervalMs, 120000);
     assert.equal(c.recycleMax, 3);
     assert.equal(c.recycleWindowMs, 600000);
+    assert.equal(c.stallSlowIntervalMs, 600000);
     assert.equal(c.rotation, true);
     assert.equal(c.rotateSoftMin, 270);
     assert.equal(c.rotateHardMin, 290);
@@ -119,7 +120,9 @@ test('readRelayConfig honors env overrides and off switches', () => {
         SONIOX_KEEPALIVE_MS: '5000',
         SONIOX_REDIAL_DELAYS_MS: '500, 1500,2500',
         SONIOX_STALL_QUIET_MS: 'not-a-number',
+        SONIOX_STALL_SLOW_INTERVAL_MS: '300000',
     });
+    assert.equal(c.stallSlowIntervalMs, 300000);
     assert.equal(c.wsUrl, 'ws://127.0.0.1:1');
     assert.equal(c.langId, false);
     assert.equal(c.strictHints, false);

@@ -48,6 +48,7 @@ export function readRelayConfig(env = process.env) {
         recycleMinIntervalMs: num(env.SONIOX_RECYCLE_MIN_INTERVAL_MS, 120000),
         recycleMax: num(env.SONIOX_RECYCLE_MAX, 3),
         recycleWindowMs: num(env.SONIOX_RECYCLE_WINDOW_MS, 600000),
+        stallSlowIntervalMs: num(env.SONIOX_STALL_SLOW_INTERVAL_MS, 600000),
         rotation: flag(env.SONIOX_ROTATION, true),
         rotateSoftMin: num(env.SONIOX_ROTATE_SOFT_MIN, 270),
         rotateHardMin: num(env.SONIOX_ROTATE_HARD_MIN, 290),
@@ -72,10 +73,26 @@ export function describeRelayConfig(config) {
     const c = config;
     return `url=${c.wsUrl} langId=${c.langId} strictHints=${c.strictHints} keepaliveMs=${c.keepaliveMs} `
         + `stallWatchdog=${c.stallWatchdog} stallSegments=${c.stallSegments} stallQuietMs=${c.stallQuietMs} stallCountNone=${c.stallCountNone} `
+        + `recycleMinIntervalMs=${c.recycleMinIntervalMs} recycleMax=${c.recycleMax}/${c.recycleWindowMs}ms stallSlowIntervalMs=${c.stallSlowIntervalMs} `
         + `rotation=${c.rotation} soft=${c.rotateSoftMin}m hard=${c.rotateHardMin}m backstop=${c.rotateBackstopMin}m `
         + `rotateRetryMs=${c.rotateRetryMs}/${c.rotateRetryMaxMs} minDialIntervalMs=${c.minDialIntervalMs} `
         + `redialDelaysMs=${c.redialDelaysMs.join('/')} audioBufferMs=${c.audioBufferMs}`;
 }
+
+// The proxy_notice events clients may receive. Both clients ignore unknown
+// frame types, so this list only grows.
+//   translation_stalled      a stall was declared and a recycle follows (never sent alone)
+//   stream_recycled          a replacement stream is live (stall recycle, loss re-dial, restart)
+//   stream_rotated           a replacement is live after the pre-cap rotation (carries minutes)
+//   translation_unavailable  RESERVED for a future "the engine cannot be reached" condition.
+//                            No path sends it today. The stall watchdog used to send it when
+//                            the recycle cap was hit; slow mode replaced that hard stop because
+//                            speech or singing in the target language looks exactly like a
+//                            stall (finals tagged none, no translation) and would have shown
+//                            operators a false "Translation unavailable" banner.
+export const PROXY_NOTICE_EVENTS = Object.freeze([
+    'translation_stalled', 'stream_recycled', 'stream_rotated', 'translation_unavailable',
+]);
 
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -137,7 +154,10 @@ export class Relay {
         this.stall = this.freshStallState();
         this.recycleTimes = [];
         this.lastRecycleAt = null;
-        this.unavailableSent = false;
+        // Slow mode: the recycle cap was reached. The watchdog stays armed
+        // but recycles no more often than stallSlowIntervalMs, until a
+        // translation token on the current stream clears it.
+        this.slowMode = false;
 
         this.rotation = { phase: 'none', quietTimer: null, backstopTimer: null, tick: null, retryAfter: 0, minutes: 0, failures: 0, waitLogged: false };
         this.adoptNotice = null;
@@ -688,7 +708,7 @@ export class Relay {
     }
 
     get watchdogActive() {
-        return this.config.stallWatchdog && this.translationConfigured && !this.unavailableSent;
+        return this.config.stallWatchdog && this.translationConfigured;
     }
 
     observeTokens(tokens) {
@@ -733,6 +753,16 @@ export class Relay {
         const s = this.stall;
         if (s.seg) s.seg.hadTranslation = true;
         else if (s.lastClosed) s.lastClosed.hadTranslation = true;
+        if (this.slowMode) this.leaveSlowMode();
+    }
+
+    // Translation is flowing again on the current stream: back to the normal
+    // recycle interval with a fresh cap window. lastRecycleAt is kept so the
+    // normal interval still counts from the last real recycle.
+    leaveSlowMode() {
+        this.slowMode = false;
+        this.recycleTimes = [];
+        this.log(`[stall] normal mode ${this.tag}: translation resumed on stream ${this.current ? this.current.index : '-'}, recycle window reset`);
     }
 
     onEndpoint() {
@@ -778,16 +808,21 @@ export class Relay {
     declareStall() {
         const up = this.current;
         const now = this.now();
-        this.log(`[stall] ${up ? up.summaryLine() : this.tag} segments=${this.config.stallSegments} recyclesInWindow=${this.recyclesInWindow(now)}`);
-        if (this.recyclesInWindow(now) >= this.config.recycleMax) {
-            if (!this.unavailableSent) {
-                this.unavailableSent = true;
-                this.sendNotice('translation_unavailable');
-            }
-            return;
+        const inWindow = this.recyclesInWindow(now);
+        this.log(`[stall] ${up ? up.summaryLine() : this.tag} segments=${this.config.stallSegments} recyclesInWindow=${inWindow} slowMode=${this.slowMode}`);
+        if (!this.slowMode && inWindow >= this.config.recycleMax) {
+            // The cap used to disarm the watchdog for the rest of the
+            // connection and send translation_unavailable. A speaker talking
+            // or singing in the target language produces the same shape as a
+            // real stall, so that hard stop both removed protection against a
+            // later real stall and would show a false banner. Slow mode keeps
+            // the watchdog armed and spaces recycles far apart instead.
+            this.slowMode = true;
+            this.log(`[stall] slow mode ${this.tag}: ${inWindow} recycles in ${this.config.recycleWindowMs} ms, next recycle no sooner than ${this.config.stallSlowIntervalMs} ms after the last`);
         }
-        if (this.lastRecycleAt !== null && now - this.lastRecycleAt < this.config.recycleMinIntervalMs) {
-            this.log(`${this.tag} recycle suppressed: last recycle ${now - this.lastRecycleAt} ms ago`);
+        const minInterval = this.slowMode ? this.config.stallSlowIntervalMs : this.config.recycleMinIntervalMs;
+        if (this.lastRecycleAt !== null && now - this.lastRecycleAt < minInterval) {
+            this.log(`${this.tag} recycle suppressed${this.slowMode ? ' (slow mode)' : ''}: last recycle ${now - this.lastRecycleAt} ms ago`);
             return;
         }
         if (this.pending) {
