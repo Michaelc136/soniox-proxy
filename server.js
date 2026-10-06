@@ -68,6 +68,7 @@ const server = createServer(async (req, res) => {
         res.end(JSON.stringify({ 
             status: 'healthy', 
             service: 'soniox-proxy',
+            build: 'reliability-2026-10',
             timestamp: new Date().toISOString()
         }));
         return;
