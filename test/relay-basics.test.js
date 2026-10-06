@@ -1,5 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { WebSocket } from 'ws';
+import { Relay } from '../relay.js';
 import { startMockSoniox, waitUntil } from './mock-soniox.js';
 import { startRelayHost, connectClient, fastConfig, sleep, TEST_API_KEY, DEFAULT_CLIENT_CONFIG } from './helpers.js';
 
@@ -218,6 +220,78 @@ test('client disconnect closes the upstream and clears the relay', async () => {
         await waitUntil(() => env.mock.streams[0].closed, 2000, 'upstream not closed');
         assert.equal(env.host.relays[0].closed, true);
         assert.equal(env.host.relays[0].current, null);
+    } finally {
+        await env.teardown();
+    }
+});
+
+test('F2: attach() on a client socket that already closed destroys the relay instead of leaking it', () => {
+    const listeners = {};
+    const deadWs = {
+        readyState: WebSocket.CLOSED,
+        on(name) { listeners[name] = (listeners[name] || 0) + 1; },
+        close() {},
+        ping() {},
+    };
+    let onClosedCalls = 0;
+    const relay = new Relay({
+        clientWs: deadWs, connectionId: 'gone', apiKey: TEST_API_KEY,
+        config: fastConfig('ws://127.0.0.1:1'), log: () => {}, onClosed: () => { onClosedCalls += 1; },
+    });
+    assert.equal(relay.attach(), false);
+    assert.equal(relay.closed, true);
+    assert.equal(relay.heartbeatTimer, null, 'no heartbeat interval left running');
+    assert.equal(onClosedCalls, 1, 'the owner is told so the connections map entry goes');
+    assert.deepEqual(listeners, {}, 'no listeners registered on a dead socket');
+});
+
+test('F4: a flood of identical action:start frames opens no extra upstream', async () => {
+    const env = await setup({}, { ackDelayMs: 100 });
+    try {
+        const client = await connectClient(env.host.url);
+        for (let i = 0; i < 40; i += 1) {
+            client.sendJson({ action: 'start', config: DEFAULT_CLIENT_CONFIG });
+            await sleep(20);
+        }
+        await client.waitForType('proxy_ready');
+        await sleep(300);
+        const relay = env.host.relays[0];
+        assert.equal(env.mock.streams.length, 1, 'one Soniox socket for forty starts');
+        assert.equal(client.ofType('proxy_ready').length, 1);
+        assert.equal(relay.stats.suppressedStarts, 39);
+        assert.ok(env.host.logs.some((l) => l.includes('start suppressed: identical config')));
+        assert.equal(relay.current && relay.current.index, 1);
+        assert.equal(relay.pending, null);
+        await client.pump(3, 5);
+        await waitUntil(() => env.mock.streams[0].audioFrames >= 3, 2000, 'audio still flows');
+        client.close();
+    } finally {
+        await env.teardown();
+    }
+});
+
+test('F4: starts with changing configs are throttled to one dial per minDialIntervalMs and the last config wins', async () => {
+    const env = await setup({ minDialIntervalMs: 200 }, { ackDelayMs: 20 });
+    try {
+        const client = await connectClient(env.host.url);
+        const t0 = Date.now();
+        let last = null;
+        for (let i = 0; i < 30; i += 1) {
+            last = { ...DEFAULT_CLIENT_CONFIG, language_hints: [i % 2 ? 'fr' : 'en'] };
+            client.sendJson({ action: 'start', config: last });
+            await sleep(20);
+        }
+        const elapsed = Date.now() - t0;
+        await sleep(500);
+        const relay = env.host.relays[0];
+        assert.ok(env.mock.streams.length >= 2, 'the config change was applied');
+        assert.ok(env.mock.streams.length <= 6, `${env.mock.streams.length} dials for 30 starts in ${elapsed} ms`);
+        assert.equal(client.ofType('proxy_ready').length, 1);
+        assert.deepEqual(relay.current.clientConfig.language_hints, last.language_hints, 'the live stream carries the last config sent');
+        assert.equal(relay.pending, null);
+        assert.equal(relay.restart.timer, null);
+        assert.ok(env.host.logs.some((l) => l.includes('start coalesced into the scheduled restart')));
+        client.close();
     } finally {
         await env.teardown();
     }

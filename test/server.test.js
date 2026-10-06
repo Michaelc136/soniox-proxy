@@ -26,22 +26,25 @@ async function freePort() {
     });
 }
 
-async function startFakeSupabase() {
+async function startFakeSupabase({ delayMs = 0 } = {}) {
     const requests = [];
     const srv = createServer((req, res) => {
         requests.push({ url: req.url, auth: req.headers.authorization || '' });
-        if (req.url.startsWith('/auth/v1/user') && req.method === 'GET') {
-            if (req.headers.authorization === `Bearer ${GOOD_TOKEN}`) {
-                res.writeHead(200, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ id: 'user-test-1', aud: 'authenticated', role: 'authenticated', email: 'tester@example.com' }));
+        const answer = () => {
+            if (req.url.startsWith('/auth/v1/user') && req.method === 'GET') {
+                if (req.headers.authorization === `Bearer ${GOOD_TOKEN}`) {
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ id: 'user-test-1', aud: 'authenticated', role: 'authenticated', email: 'tester@example.com' }));
+                    return;
+                }
+                res.writeHead(401, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ message: 'invalid token', msg: 'invalid token' }));
                 return;
             }
-            res.writeHead(401, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ message: 'invalid token', msg: 'invalid token' }));
-            return;
-        }
-        res.writeHead(404);
-        res.end();
+            res.writeHead(404);
+            res.end();
+        };
+        if (delayMs > 0) setTimeout(answer, delayMs); else answer();
     });
     await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve));
     return {
@@ -140,6 +143,71 @@ test('server.js rejects a bad JWT with 1008 and never dials Soniox', async () =>
         assert.equal(frames[0].type, 'error');
         assert.equal(frames[0].code, 401);
         assert.equal(mock.streams.length, 0);
+    } finally {
+        await server.stop();
+        await supa.close();
+        await mock.close();
+    }
+});
+
+test('F1: a malformed client frame during the JWT check does not kill the process or the other sessions', async () => {
+    const mock = await startMockSoniox();
+    const supa = await startFakeSupabase({ delayMs: 400 });
+    const server = await startServer({ SONIOX_WS_URL: mock.url, SUPABASE_URL: supa.url });
+    try {
+        // An innocent bystander session that is fully up and streaming.
+        const bystander = await connectClient(`${server.url}?token=${GOOD_TOKEN}`);
+        await bystander.start();
+
+        // A second client sends invalid UTF-8 as a TEXT frame while its JWT
+        // check is still in flight: the window where no relay exists yet.
+        const { WebSocket } = await import('ws');
+        const attacker = new WebSocket(`${server.url}?token=${GOOD_TOKEN}`);
+        attacker.on('error', () => { /* the server closes it with 1007 */ });
+        await new Promise((resolve) => attacker.once('open', resolve));
+        attacker.send(Buffer.from([0xc3, 0x28, 0xa0, 0xa1]), { binary: false });
+        await sleep(800);
+
+        const health = await fetch(`${server.httpUrl}/health`).then((r) => r.json());
+        assert.equal(health.status, 'healthy', 'the process survived');
+        assert.equal(bystander.closeCode, null, 'the other session is untouched');
+        await bystander.pump(3, 10);
+        await waitUntil(() => mock.streams[0].audioFrames >= 3, 2000, 'bystander audio still relayed');
+        const text = server.text();
+        assert.ok(text.includes('client socket error'), 'the bad frame was logged, not thrown');
+        assert.equal(text.includes('Emitted error event'), false);
+        assert.ok(text.includes('no relay created'), 'the dead attacker socket got no relay after auth');
+        bystander.close();
+    } finally {
+        await server.stop();
+        await supa.close();
+        await mock.close();
+    }
+});
+
+test('F2: clients that leave during the JWT check leave no relay behind', async () => {
+    const mock = await startMockSoniox();
+    const supa = await startFakeSupabase({ delayMs: 400 });
+    const server = await startServer({ SONIOX_WS_URL: mock.url, SUPABASE_URL: supa.url, SONIOX_HEARTBEAT_MS: '200' });
+    try {
+        const { WebSocket } = await import('ws');
+        for (let i = 0; i < 5; i += 1) {
+            const ws = new WebSocket(`${server.url}?token=${GOOD_TOKEN}`);
+            ws.on('error', () => { /* ignore */ });
+            await new Promise((resolve) => ws.once('open', resolve));
+            await sleep(30);
+            ws.close(1000); // leaves inside the 400 ms auth window
+        }
+        await sleep(1200);
+        const text = server.text();
+        const ids = [...text.matchAll(/\[(\w+)\] New client connection/g)].map((m) => m[1]);
+        assert.equal(ids.length, 5);
+        assert.equal((text.match(/no relay created/g) || []).length, 5, 'every early leaver was skipped after auth');
+        assert.equal(text.includes('Auth complete'), false, 'no relay attached to a dead socket');
+
+        await server.stop();
+        const after = server.text();
+        assert.equal((after.match(/Cleaning up connection/g) || []).length, 0, 'nothing left in the connections map at SIGTERM');
     } finally {
         await server.stop();
         await supa.close();

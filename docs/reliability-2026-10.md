@@ -220,3 +220,37 @@ logic, or StudioEngine.tsx. Add a vitest for the pure mapping. `npx tsc --noEmit
   `language_hints_strict` the recommended remedy, and whether keepalive versus silent audio during
   gaps matters; note our stream rotation plan; ask them to check their side for those streams.
   Plain text, no em dashes, signed Michael Colley, Selah Translate.
+
+## Review fixes applied 2026-10-05 (worktree, local only)
+
+Confirmed findings from the adversarial review of the branch, each with a regression test in
+`test/` (test names carry the finding id):
+
+- R1 (relay.js, handleUpstreamClose): when the current stream dies while a rotation
+  replacement is already acked and waiting for its trigger, the replacement is adopted at
+  once (notice `stream_rotated` with the lost stream's minutes). A still-dialing replacement
+  is adopted by its continuation as before.
+- R2 (relay.js, armPendingKeepalive): an acked rotation replacement receives
+  `{"type":"keepalive"}` on SONIOX_KEEPALIVE_MS while it waits, so Soniox's 20 s idle rule
+  cannot close it; cleared on adoption, drop, or relay close.
+- R3 (relay.js, observeTokens): finals tagged `translation_status: none` count as
+  untranslated segment content for the stall watchdog (SONIOX_STALL_COUNT_NONE, default on).
+- F1 (server.js): `error` and `close` listeners are attached to the client socket before the
+  JWT await and before the early returns; a malformed frame during auth is logged, not thrown.
+  `uncaughtException` and `unhandledRejection` are logged and the process kept alive as a last
+  line of defense.
+- F2 (server.js + relay.js attach): no relay is created for a socket that closed during auth;
+  `attach()` on a non-open socket destroys the relay and returns false.
+- F3 (relay.js, commitRotation + checkRotation): endpoint and quiet triggers only commit when
+  the replacement has acked; a refused soft pre-dial keeps the old stream and retries with
+  exponential backoff (SONIOX_ROTATE_RETRY_MS doubling, capped at SONIOX_ROTATE_RETRY_MAX_MS);
+  the hard mark and backstop still switch unacked and ignore the backoff. The quiet window is
+  re-armed from the ack so an idle replacement is adopted within SONIOX_ROTATE_QUIET_MS.
+- F4 (relay.js, handleStart): a repeated `action:start` with an identical config is suppressed
+  and counted (`suppressedStarts` in the relay closing line); a changed config re-dials at most
+  once per SONIOX_MIN_DIAL_INTERVAL_MS with the latest config.
+- BC-1 (DEPLOYMENT_GUIDE.md): Rollback subsection with the env kill switches and the a171dfd
+  redeploy.
+
+Not done, noted for later: a process-wide count of open upstream sockets so a soft pre-dial is
+skipped rather than attempted when the platform is near the 10-concurrent limit.

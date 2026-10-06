@@ -43,6 +43,7 @@ export function readRelayConfig(env = process.env) {
         stallWatchdog: flag(env.SONIOX_STALL_WATCHDOG, true),
         stallSegments: num(env.SONIOX_STALL_SEGMENTS, 6),
         stallQuietMs: num(env.SONIOX_STALL_QUIET_MS, 20000),
+        stallCountNone: flag(env.SONIOX_STALL_COUNT_NONE, true),
         segmentGapMs: num(env.SONIOX_SEGMENT_GAP_MS, 700),
         recycleMinIntervalMs: num(env.SONIOX_RECYCLE_MIN_INTERVAL_MS, 120000),
         recycleMax: num(env.SONIOX_RECYCLE_MAX, 3),
@@ -52,6 +53,9 @@ export function readRelayConfig(env = process.env) {
         rotateHardMin: num(env.SONIOX_ROTATE_HARD_MIN, 290),
         rotateBackstopMin: num(env.SONIOX_ROTATE_BACKSTOP_MIN, 292),
         rotateQuietMs: num(env.SONIOX_ROTATE_QUIET_MS, 600),
+        rotateRetryMs: num(env.SONIOX_ROTATE_RETRY_MS, 5000),
+        rotateRetryMaxMs: num(env.SONIOX_ROTATE_RETRY_MAX_MS, 60000),
+        minDialIntervalMs: num(env.SONIOX_MIN_DIAL_INTERVAL_MS, 1000),
         finalizeTailMs: num(env.SONIOX_FINALIZE_TAIL_MS, 1500),
         endGraceMs: num(env.SONIOX_END_GRACE_MS, 500),
         audioBufferMs: num(env.SONIOX_AUDIO_BUFFER_MS, 15000),
@@ -67,13 +71,28 @@ export function readRelayConfig(env = process.env) {
 export function describeRelayConfig(config) {
     const c = config;
     return `url=${c.wsUrl} langId=${c.langId} strictHints=${c.strictHints} keepaliveMs=${c.keepaliveMs} `
-        + `stallWatchdog=${c.stallWatchdog} stallSegments=${c.stallSegments} stallQuietMs=${c.stallQuietMs} `
+        + `stallWatchdog=${c.stallWatchdog} stallSegments=${c.stallSegments} stallQuietMs=${c.stallQuietMs} stallCountNone=${c.stallCountNone} `
         + `rotation=${c.rotation} soft=${c.rotateSoftMin}m hard=${c.rotateHardMin}m backstop=${c.rotateBackstopMin}m `
+        + `rotateRetryMs=${c.rotateRetryMs}/${c.rotateRetryMaxMs} minDialIntervalMs=${c.minDialIntervalMs} `
         + `redialDelaysMs=${c.redialDelaysMs.join('/')} audioBufferMs=${c.audioBufferMs}`;
 }
 
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Key-order independent JSON, so two start configs compare by content.
+function stableStringify(value) {
+    if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+    if (value && typeof value === 'object') {
+        return `{${Object.keys(value).sort().map((k) => `${JSON.stringify(k)}:${stableStringify(value[k])}`).join(',')}}`;
+    }
+    return JSON.stringify(value);
+}
+
+export function sameConfig(a, b) {
+    if (!a || !b) return false;
+    return stableStringify(a) === stableStringify(b);
 }
 
 function looksLikeJsonBuffer(data) {
@@ -107,21 +126,35 @@ export class Relay {
         this.buffer = { chunks: [], bytes: 0, capBytes: 0, droppedBytes: 0 };
         this.lastAudioAt = null;
         this.keepaliveTimer = null;
+        this.pendingKeepaliveTimer = null;
         this.heartbeatTimer = null;
+
+        // Repeated action:start frames: one re-dial per minDialIntervalMs,
+        // always with the latest config; identical repeats are suppressed.
+        this.restart = { timer: null, config: null };
+        this.lastStartDialAt = 0;
 
         this.stall = this.freshStallState();
         this.recycleTimes = [];
         this.lastRecycleAt = null;
         this.unavailableSent = false;
 
-        this.rotation = { phase: 'none', quietTimer: null, backstopTimer: null, tick: null, retryAfter: 0, minutes: 0 };
+        this.rotation = { phase: 'none', quietTimer: null, backstopTimer: null, tick: null, retryAfter: 0, minutes: 0, failures: 0, waitLogged: false };
         this.adoptNotice = null;
-        this.stats = { audioFramesIn: 0, audioBytesIn: 0, droppedFrames: 0 };
+        this.stats = { audioFramesIn: 0, audioBytesIn: 0, droppedFrames: 0, suppressedStarts: 0 };
     }
 
     // ---- lifecycle -------------------------------------------------------
 
+    // Returns false when the client socket is already gone: a client that
+    // left during the JWT check must not leave a relay (and its heartbeat
+    // interval) behind that nothing will ever destroy.
     attach() {
+        if (this.clientWs.readyState !== WebSocket.OPEN) {
+            this.log(`${this.tag} client socket not open at attach (readyState ${this.clientWs.readyState})`);
+            this.destroy('client_gone');
+            return false;
+        }
         this.clientWs.on('message', (data, isBinary) => this.handleClientMessage(data, isBinary));
         this.clientWs.on('close', (code, reason) => {
             this.log(`${this.tag} client disconnected: ${code} ${reason ? reason.toString() : ''}`);
@@ -137,13 +170,16 @@ export class Relay {
             if (this.current) this.current.ping();
             if (this.pending) this.pending.ping();
         }, this.config.heartbeatMs);
+        return true;
     }
 
     destroy(reason = 'destroyed') {
         if (this.closed) return;
         this.closed = true;
-        this.log(`${this.tag} relay closing (${reason}); frames in=${this.stats.audioFramesIn} bytes in=${this.stats.audioBytesIn} dropped=${this.stats.droppedFrames} bufferDropped=${this.buffer.droppedBytes}`);
+        this.log(`${this.tag} relay closing (${reason}); frames in=${this.stats.audioFramesIn} bytes in=${this.stats.audioBytesIn} dropped=${this.stats.droppedFrames} bufferDropped=${this.buffer.droppedBytes} suppressedStarts=${this.stats.suppressedStarts}`);
         this.stopStreamTimers();
+        this.stopPendingKeepalive();
+        if (this.restart.timer) { clearTimeout(this.restart.timer); this.restart.timer = null; }
         if (this.heartbeatTimer) { clearInterval(this.heartbeatTimer); this.heartbeatTimer = null; }
         if (this.rotation.tick) { clearInterval(this.rotation.tick); this.rotation.tick = null; }
         for (const up of [this.current, this.pending, ...this.retiring]) {
@@ -287,13 +323,46 @@ export class Relay {
         this.log(`${this.tag} start: model=${config.model || '-'} hints=${JSON.stringify(config.language_hints || null)} `
             + `translation=${this.translationConfigured ? (config.translation.target_language) : 'off'} endpointing=${config.enable_endpoint_detection !== false}`);
 
-        if (this.current || this.pending) {
-            // A second start replaces the stream instead of leaking one.
-            this.log(`${this.tag} start received again; replacing upstream`);
-            this.replaceUpstream('restart');
+        if (!this.current && !this.pending && !this.restart.timer) {
+            this.lastStartDialAt = this.now();
+            this.openFirstUpstream();
             return;
         }
-        this.openFirstUpstream();
+        // A repeated start. Both clients send one start per socket, so a
+        // repeat is a client stuck in a loop or a deliberate config change.
+        // Identical to what is live, dialing, or already scheduled: nothing
+        // to do. Different: one replacement dial, at most one per
+        // minDialIntervalMs, carrying whatever config arrived last.
+        const live = this.pending || this.current;
+        const target = this.restart.config || (live ? live.clientConfig : null);
+        if (sameConfig(target, config)) {
+            this.stats.suppressedStarts += 1;
+            if (this.stats.suppressedStarts === 1 || this.stats.suppressedStarts % 50 === 0) {
+                this.log(`${this.tag} start suppressed: identical config (${this.stats.suppressedStarts} so far)`);
+            }
+            return;
+        }
+        this.scheduleRestart(config);
+    }
+
+    scheduleRestart(config) {
+        this.restart.config = config;
+        if (this.restart.timer) {
+            this.log(`${this.tag} start coalesced into the scheduled restart`);
+            return;
+        }
+        const wait = Math.max(0, this.lastStartDialAt + this.config.minDialIntervalMs - this.now());
+        this.log(`${this.tag} start received again with a new config; replacing upstream in ${wait} ms`);
+        this.restart.timer = setTimeout(() => {
+            this.restart.timer = null;
+            const latest = this.restart.config;
+            this.restart.config = null;
+            if (this.closed || !latest) return;
+            this.clientConfig = latest;
+            this.translationConfigured = !!(latest.translation && latest.translation.target_language);
+            this.lastStartDialAt = this.now();
+            this.replaceUpstream('restart');
+        }, wait);
     }
 
     newUpstream() {
@@ -359,6 +428,7 @@ export class Relay {
     adopt(up, notice) {
         if (this.closed) { up.close(); return; }
         if (this.pending === up) this.pending = null;
+        this.stopPendingKeepalive();
         this.current = up;
         this.buffering = false;
         this.stall = this.freshStallState();
@@ -462,10 +532,10 @@ export class Relay {
             // Acked but not yet adopted (rotation waiting for its trigger) and
             // gone again: forget it, and re-dial if nothing is live.
             this.pending = null;
+            this.stopPendingKeepalive();
             this.log(`${this.tag} pending stream ${up.index} closed before adoption (code ${info.code})`);
             if (this.rotation.phase === 'predial') {
-                this.rotation.phase = 'none';
-                this.rotation.retryAfter = this.now() + 5000;
+                this.scheduleRotationRetry(`pending stream ${up.index} closed`);
             }
             if (!this.current) {
                 this.rotation.phase = 'none';
@@ -485,8 +555,23 @@ export class Relay {
             this.log(`${this.tag} stream ${up.index} lost (code ${info.code}), re-dialing`);
         }
         if (this.pending) {
-            // A switch is already dialing; its continuation adopts on ack and
-            // falls into recover() on failure.
+            if (this.rotation.phase === 'predial') {
+                // The rotation's commit point has arrived the hard way: the
+                // old stream is gone, so the replacement is the switch target.
+                const minutes = Math.round(up.elapsedMinutes() * 100) / 100;
+                this.rotation.minutes = minutes;
+                this.rotation.phase = 'switching';
+                this.adoptNotice = { event: 'stream_rotated', extra: { minutes } };
+            }
+            if (this.pending.acked) {
+                // Already acked and waiting for a trigger that can no longer
+                // come from the old stream: take it live now.
+                this.log(`${this.tag} adopting acked pending stream ${this.pending.index} after stream ${up.index} was lost`);
+                this.adopt(this.pending, this.takeAdoptNotice() || { event: 'stream_recycled' });
+                return;
+            }
+            // Still dialing: its continuation adopts on ack (nothing is
+            // current) and falls into recover() on failure.
             return;
         }
         this.recover(maxDuration ? 'max_duration_reached' : `upstream_closed_${info.code}`, maxDuration);
@@ -533,6 +618,7 @@ export class Relay {
             // A new start carries a new config: the in-flight dial is stale.
             const stale = this.pending;
             this.pending = null;
+            this.stopPendingKeepalive();
             this.rotation.phase = 'none';
             if (this.rotation.quietTimer) { clearTimeout(this.rotation.quietTimer); this.rotation.quietTimer = null; }
             stale.close();
@@ -570,6 +656,24 @@ export class Relay {
         this.armKeepalive();
     }
 
+    // A pre-dialed rotation stream can sit acked and idle for many seconds of
+    // continuous speech before its commit trigger. Soniox closes a stream
+    // that gets neither audio nor keepalive for 20 s, so it is kept alive on
+    // the same interval until it is adopted or dropped.
+    armPendingKeepalive(up) {
+        this.stopPendingKeepalive();
+        const ms = this.config.keepaliveMs;
+        if (!(ms > 0)) return;
+        this.pendingKeepaliveTimer = setInterval(() => {
+            if (this.closed || this.pending !== up || !up.isOpen) { this.stopPendingKeepalive(); return; }
+            up.sendKeepalive();
+        }, ms);
+    }
+
+    stopPendingKeepalive() {
+        if (this.pendingKeepaliveTimer) { clearInterval(this.pendingKeepaliveTimer); this.pendingKeepaliveTimer = null; }
+    }
+
     stopStreamTimers() {
         if (this.keepaliveTimer) { clearTimeout(this.keepaliveTimer); this.keepaliveTimer = null; }
         if (this.stall.gapTimer) { clearTimeout(this.stall.gapTimer); this.stall.gapTimer = null; }
@@ -602,7 +706,10 @@ export class Relay {
             const status = token.translation_status || 'original';
             if (status === 'translation') {
                 this.onTranslationToken();
-            } else if (status === 'original' && token.is_final) {
+            } else if (token.is_final && (status === 'original' || (status === 'none' && this.config.stallCountNone))) {
+                // "none" is Soniox's tag for speech it judged outside the
+                // configured pair: captions flow, no translation follows,
+                // which is exactly the stall shape this watchdog exists for.
                 this.onFinalOriginalToken();
             }
         }
@@ -706,6 +813,8 @@ export class Relay {
         if (this.rotation.backstopTimer) { clearTimeout(this.rotation.backstopTimer); this.rotation.backstopTimer = null; }
         this.rotation.phase = 'none';
         this.rotation.retryAfter = 0;
+        this.rotation.failures = 0;
+        this.rotation.waitLogged = false;
         if (!this.config.rotation || !this.current) return;
         const up = this.current;
         const sinceOpen = this.now() - (up.openedAt || this.now());
@@ -731,14 +840,27 @@ export class Relay {
             if (minutes >= this.config.rotateHardMin) this.commitRotation('hard mark');
             return;
         }
-        if (this.rotation.phase !== 'none') return;
-        if (this.pending || this.now() < this.rotation.retryAfter) return;
+        if (this.rotation.phase !== 'none' || this.pending) return;
         if (minutes >= this.config.rotateHardMin) {
+            // The hard mark ignores the soft retry backoff: by now the stream
+            // must go regardless of how the pre-dials went.
             this.startRotation('hard mark');
             if (this.rotation.phase === 'predial') this.commitRotation('hard mark');
-        } else if (minutes >= this.config.rotateSoftMin) {
+        } else if (minutes >= this.config.rotateSoftMin && this.now() >= this.rotation.retryAfter) {
             this.startRotation('soft mark');
         }
+    }
+
+    // A failed soft pre-dial keeps the healthy old stream and tries again
+    // with exponential backoff (5 s, 10 s, 20 s, ... capped) until the hard
+    // mark takes over.
+    scheduleRotationRetry(why) {
+        this.rotation.phase = 'none';
+        if (this.rotation.quietTimer) { clearTimeout(this.rotation.quietTimer); this.rotation.quietTimer = null; }
+        this.rotation.failures += 1;
+        const wait = Math.min(this.config.rotateRetryMs * (2 ** (this.rotation.failures - 1)), this.config.rotateRetryMaxMs);
+        this.rotation.retryAfter = this.now() + wait;
+        this.log(`${this.tag} rotation pre-dial failed (${why}); old stream kept, retry ${this.rotation.failures} in ${wait} ms`);
     }
 
     // Pre-dial the replacement; audio keeps flowing to the old stream until
@@ -748,8 +870,8 @@ export class Relay {
         const old = this.current;
         this.rotation.phase = 'predial';
         this.rotation.startedAt = this.now();
+        this.rotation.waitLogged = false;
         this.log(`${this.tag} rotation started (${trigger}) at ${old.elapsedMinutes().toFixed(2)} min on stream ${old.index}`);
-        this.armRotationQuiet();
         this.dialPending('rotation').then((result) => {
             if (result.superseded || this.closed) return;
             if (!result.ok) {
@@ -759,10 +881,8 @@ export class Relay {
                     this.rotation.phase = 'none';
                     this.recover('rotation dial failed', false);
                 } else {
-                    // The old stream is still fine; try again shortly.
-                    this.rotation.phase = 'none';
-                    if (this.rotation.quietTimer) { clearTimeout(this.rotation.quietTimer); this.rotation.quietTimer = null; }
-                    this.rotation.retryAfter = this.now() + 5000;
+                    // The old stream is still fine: keep it, back off, retry.
+                    this.scheduleRotationRetry(result.error ? result.error.message : 'dial failed');
                 }
                 return;
             }
@@ -771,8 +891,13 @@ export class Relay {
             if (this.rotation.phase === 'switching' || !this.current) {
                 // Commit already happened; adopt now and flush the buffer.
                 this.adopt(result.up, this.takeAdoptNotice() || { event: 'stream_rotated', extra: { minutes: this.rotation.minutes } });
+                return;
             }
-            // Otherwise wait for the commit trigger.
+            // Acked and waiting for the commit trigger: the next endpoint, or
+            // rotateQuietMs without tokens counted from this ack. Keep the
+            // idle replacement alive meanwhile.
+            this.armPendingKeepalive(result.up);
+            this.armRotationQuiet();
         });
     }
 
@@ -787,6 +912,17 @@ export class Relay {
 
     commitRotation(trigger) {
         if (this.rotation.phase !== 'predial' || !this.current) return;
+        const acked = !!(this.pending && this.pending.acked);
+        const forced = trigger === 'hard mark' || trigger === 'backstop';
+        if (!acked && !forced) {
+            // An endpoint or quiet window never retires a healthy stream for a
+            // replacement that has not acked (or was refused): keep waiting.
+            if (!this.rotation.waitLogged) {
+                this.rotation.waitLogged = true;
+                this.log(`${this.tag} rotation commit (${trigger}) deferred: replacement not acked yet`);
+            }
+            return;
+        }
         const old = this.current;
         const minutes = Math.round(old.elapsedMinutes() * 100) / 100;
         this.rotation.minutes = minutes;

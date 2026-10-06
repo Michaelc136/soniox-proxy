@@ -155,6 +155,47 @@ test('recycle cap: after recycleMax recycles in the window, translation_unavaila
     }
 });
 
+// Soniox tags speech it judges outside the configured pair translation_status
+// "none" and sends no translation: captions flow, translation does not, which
+// is the stall shape. The watchdog must count those segments too.
+test('R3: finals tagged translation_status none count as untranslated segments, unless SONIOX_STALL_COUNT_NONE is off', async () => {
+    const frame = (i, status) => JSON.stringify({
+        tokens: [
+            { text: `x${i} `, is_final: true, translation_status: status, language: 'es', start_ms: i * 500, end_ms: i * 500 + 400 },
+            { text: '<end>', is_final: true },
+        ],
+        final_audio_proc_ms: i * 500, total_audio_proc_ms: i * 500,
+    });
+
+    const envA = await setup({ stallSegments: 2, stallQuietMs: 0 }, { endEveryFrames: 0 });
+    try {
+        const client = await connectClient(envA.host.url);
+        await client.start();
+        const stream = envA.mock.streams[0];
+        for (let i = 0; i < 4; i += 1) { stream.ws.send(frame(i, 'none')); await sleep(15); }
+        await client.waitForNotice('translation_stalled', 2000);
+        assert.ok(envA.host.logs.some((l) => l.startsWith('[stall]') && l.includes('none=')), '[stall] logged with the none counter');
+        client.close();
+    } finally {
+        await envA.teardown();
+    }
+
+    const envB = await setup({ stallSegments: 2, stallQuietMs: 0, stallCountNone: false }, { endEveryFrames: 0 });
+    try {
+        const client = await connectClient(envB.host.url);
+        await client.start();
+        const stream = envB.mock.streams[0];
+        for (let i = 0; i < 8; i += 1) { stream.ws.send(frame(i, 'none')); await sleep(15); }
+        await sleep(150);
+        assert.deepEqual(client.notices(), [], 'switched off: none finals are not counted');
+        assert.equal(envB.host.relays[0].stall.streak, 0);
+        assert.equal(envB.host.relays[0].current.counters.finals.none, 8, 'the counters still record them');
+        client.close();
+    } finally {
+        await envB.teardown();
+    }
+});
+
 test('recycle rate cap: at most one recycle per recycleMinIntervalMs', async () => {
     const env = await setup({ stallSegments: 2, recycleMinIntervalMs: 60000 }, { stallAfterFrames: 0 });
     try {

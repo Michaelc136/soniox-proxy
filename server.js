@@ -620,12 +620,12 @@ const server = createServer(async (req, res) => {
 
             console.log(`DeepL Translate for user: ${user.id}, targets: [${targetLanguages.join(',')}], text length: ${text.length}`);
 
-            // DeepL language code mapping — DeepL requires specific codes
+            // DeepL language code mapping, DeepL requires specific codes
             const DEEPL_LANG_MAP = {
                 'en': 'EN-US', 'pt': 'PT-BR', 'zh': 'ZH-HANS',
                 'no': 'NB', // Norwegian Bokmål
             };
-            // Languages DeepL Free doesn't support — skip silently
+            // Languages DeepL Free doesn't support, skip silently
             const DEEPL_UNSUPPORTED = new Set(['hi', 'ar', 'th', 'vi', 'he', 'ms', 'tl', 'sw', 'ht']);
 
             const results = {};
@@ -705,7 +705,21 @@ console.log(`Soniox relay: ${describeRelayConfig(RELAY_CONFIG)}`);
 wss.on('connection', async (clientWs, req) => {
     const connectionId = generateConnectionId();
     console.log(`[${connectionId}] New client connection from ${req.socket.remoteAddress}`);
-    
+
+    // Listeners first, before any await and before the early returns below.
+    // A frame the receiver rejects (bad UTF-8, bad RSV bits, oversize) makes
+    // ws emit 'error'; with no listener that is an uncaught exception that
+    // ends the process and every live session with it. The relay adds its
+    // own handlers later; these just log.
+    clientWs.on('error', (err) => {
+        console.log(`[${connectionId}] client socket error: ${err.message}`);
+    });
+    clientWs.on('close', (code) => {
+        if (!connections.has(connectionId)) {
+            console.log(`[${connectionId}] client closed before a relay was attached (code ${code})`);
+        }
+    });
+
     // Parse auth token from query string (standard for WebSocket auth over wss://).
     // The connection is TLS-encrypted end-to-end so the token is not exposed in transit.
     // Sec-WebSocket-Protocol headers are stripped by DigitalOcean/Cloudflare reverse proxies.
@@ -753,6 +767,13 @@ wss.on('connection', async (clientWs, req) => {
         return;
     }
     
+    // The client may have left during the JWT round trip: no relay for a
+    // socket that is already closing or closed.
+    if (clientWs.readyState !== WebSocket.OPEN) {
+        console.log(`[${connectionId}] client left during auth (readyState ${clientWs.readyState}), no relay created`);
+        return;
+    }
+
     // One relay per client: it owns the Soniox stream(s), the audio path,
     // keepalive, the stall watchdog, rotation and re-dial (see relay.js).
     const relay = new Relay({
@@ -764,7 +785,7 @@ wss.on('connection', async (clientWs, req) => {
         onClosed: () => connections.delete(connectionId),
     });
     connections.set(connectionId, relay);
-    relay.attach();
+    if (!relay.attach()) return;
 
     // Send immediate acknowledgment so client knows auth passed and server is ready
     console.log(`[${connectionId}] Auth complete, sending auth_success to client`);
@@ -820,4 +841,14 @@ process.on('SIGTERM', () => {
         console.log('Server closed');
         process.exit(0);
     });
+});
+
+// Last line of defense, not a fix: on DigitalOcean a crash drops every live
+// session and stays down until the health check restarts the container, so
+// an escaped exception is logged and the process is kept alive.
+process.on('uncaughtException', (err) => {
+    console.error('Uncaught exception (process kept alive):', err && err.stack ? err.stack : err);
+});
+process.on('unhandledRejection', (reason) => {
+    console.error('Unhandled rejection (process kept alive):', reason && reason.stack ? reason.stack : reason);
 });
