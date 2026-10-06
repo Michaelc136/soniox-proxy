@@ -92,10 +92,14 @@ surgical edits in server.js so the WebSocket handling delegates to relay.js. Kee
      Never log transcript text.
    - Add `enable_language_identification: true` (env SONIOX_LANG_ID, default on) so tokens carry
      `language`. Confirm both clients ignore unknown token fields (web reader: check the token
-     type in useSonioxConnection.ts; Mac: SonioxWire.swift decodes known keys only).
+     type in useSonioxConnection.ts; Mac: SonioxWire.swift decodes known keys only). An explicit
+     boolean `enable_language_identification` in the client's start config wins over that
+     default, true or false (control runs; see the 2026-10-05 follow-up below).
 2. Language restriction.
    - When the client sends exactly one language hint, send `language_hints_strict: true`
-     (env SONIOX_STRICT_HINTS, default on). With zero or several hints, do not set it.
+     (env SONIOX_STRICT_HINTS, default on). With zero or several hints, do not set it. An
+     explicit boolean `language_hints_strict` in the client's start config wins over that
+     default, true or false, regardless of the hint count (control runs; see below).
    - Stop forwarding `translation.source_language` (undocumented). Keep `type` and
      `target_language`.
 3. Keepalive during audio silence: if no audio frame has been forwarded to the current upstream
@@ -115,9 +119,12 @@ surgical edits in server.js so the WebSocket handling delegates to relay.js. Kee
    10 minutes (SONIOX_RECYCLE_MAX in SONIOX_RECYCLE_WINDOW_MS) enter SLOW MODE: the watchdog
    stays armed, the minimum interval between recycles becomes SONIOX_STALL_SLOW_INTERVAL_MS
    (default 600000, 10 minutes), and `[stall] slow mode` is logged once. Leave slow mode (back to
-   the normal interval and a fresh window) as soon as a translation token arrives on the current
-   stream. The stall path never sends `translation_unavailable` (see the 2026-10-05 slow mode
-   note below). Never send a second `proxy_ready`.
+   the normal interval) when a CLOSED segment on the current stream is judged to have had
+   translation; a lone translation token is not enough. The recycle window is not cleared on the
+   way out, it expires on its own, and if it still holds SONIOX_RECYCLE_MAX recycles the next
+   stall simply re-enters slow mode. SONIOX_RECYCLE_MAX=0 means never recycle for a stall (the
+   stall is still declared and logged). The stall path never sends `translation_unavailable`
+   (see the 2026-10-05 slow mode note below). Never send a second `proxy_ready`.
 5. Rotation before the cap (env SONIOX_ROTATION default on, SONIOX_ROTATE_SOFT_MIN=270,
    SONIOX_ROTATE_HARD_MIN=290, SONIOX_ROTATE_BACKSTOP_MIN=292). Measure both audio minutes
    forwarded and wall minutes since the upstream opened; use whichever is larger. At the soft
@@ -280,9 +287,10 @@ Change (relay.js, declareStall / onTranslationToken, with the regression test in
   armed, the minimum interval between recycles rises to SONIOX_STALL_SLOW_INTERVAL_MS (default
   600000, 10 minutes), and `[stall] slow mode` is logged once. Stalls declared inside the slow
   interval are logged as `recycle suppressed (slow mode)`.
-- Slow mode ends as soon as a translation token arrives on the current stream: back to
-  SONIOX_RECYCLE_MIN_INTERVAL_MS and a fresh cap window (`recycleTimes` cleared, `lastRecycleAt`
-  kept so the normal interval still counts from the last real recycle). Logged as
+- Slow mode ends when a closed segment on the current stream is judged to have had translation
+  (the first version left on any translation token and cleared the window; corrected the same
+  day, see the follow-up below): back to SONIOX_RECYCLE_MIN_INTERVAL_MS, `recycleTimes` kept,
+  `lastRecycleAt` kept so the normal interval still counts from the last real recycle. Logged as
   `[stall] normal mode`.
 - The stall path never sends `translation_unavailable`. The event stays in the notice contract
   (`PROXY_NOTICE_EVENTS` in relay.js, the DEPLOYMENT_GUIDE table) as RESERVED for a future "the
@@ -290,3 +298,39 @@ Change (relay.js, declareStall / onTranslationToken, with the regression test in
   nothing else was touched.
 - `translation_stalled` and `stream_recycled` are unchanged, including the rule that
   `translation_stalled` is sent only when a recycle actually follows.
+
+## Follow-up 2026-10-05: slow mode exit, SONIOX_RECYCLE_MAX=0, client-pinned start flags
+
+Three defects or gaps found in review of the slow mode change, each with a regression test:
+
+1. Slow mode exit (relay.js, evaluateClosedSegment / leaveSlowMode; test/stall.test.js).
+   The first version left slow mode on ANY translation token and cleared `recycleTimes`. During
+   singing in the target language Soniox returns the odd translated phrase, so every such token
+   reset the cap window and the next stall recycled on the normal interval again: the cap was
+   effectively unbounded. Now:
+   - Slow mode is left only when a CLOSED segment that had translation is judged (in
+     `evaluateClosedSegment`, the `seg.hadTranslation` branch, which is also where the streak
+     resets). A lone translation token no longer does anything beyond marking its segment.
+   - `recycleTimes` is NOT cleared on exit. The window expires on its own. If it still holds
+     SONIOX_RECYCLE_MAX recycles when the next stall is declared, slow mode is simply re-entered
+     (and `[stall] slow mode` logged again). `lastRecycleAt` is kept as before.
+   - Log line on exit: `[stall] normal mode [<conn>]: translated segment on stream <K>`.
+2. SONIOX_RECYCLE_MAX=0 (relay.js, declareStall; test/stall.test.js). The first version
+   recycled once (nothing had happened yet, so the interval check passed) and then entered slow
+   mode. Zero or less now means "never recycle for a stall": the stall is still declared and
+   logged with its counters, then `[<conn>] recycle suppressed (recycleMax=0)` is logged and the
+   watchdog returns. No stream is dialed, slow mode is never entered, and no notice is sent
+   (`translation_stalled` is only sent when a recycle follows). Documented in the
+   DEPLOYMENT_GUIDE row.
+3. Control runs (upstream.js, resolveStartFlags / buildSonioxConfig; relay.js, handleStart;
+   test/config.test.js, test/relay-basics.test.js). If the client's start config carries an
+   explicit boolean `language_hints_strict`, it is sent as is, true or false, instead of the
+   proxy default (strict when exactly one hint, controlled by SONIOX_STRICT_HINTS). The same rule
+   applies to `enable_language_identification` (default controlled by SONIOX_LANG_ID). Only a
+   real boolean counts; absent, null or a string means "omitted" and the default applies. Both
+   production clients omit both fields, so nothing changes for them. The relay's start line now
+   ends with the provenance of each flag:
+   `[<conn>] start: model=... hints=[...] translation=... endpointing=... strictHints=client:<value> langId=default:<value>`
+   where each of the two reads `client:<true|false>` when the client pinned it and
+   `default:<true|false>` otherwise (`default:false` means the field is not sent). The
+   `[stream n] sent start config` line still shows the redacted config that actually went out.

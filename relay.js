@@ -11,7 +11,7 @@
 //   * two upstream sockets overlap only for the ack wait of a switch.
 
 import { WebSocket } from 'ws';
-import { Upstream, DEFAULT_SONIOX_WS_URL, bytesPerSecond } from './upstream.js';
+import { Upstream, DEFAULT_SONIOX_WS_URL, bytesPerSecond, resolveStartFlags, describeStartFlags } from './upstream.js';
 
 const FLAG_OFF = /^(0|false|off|no)$/i;
 
@@ -155,8 +155,8 @@ export class Relay {
         this.recycleTimes = [];
         this.lastRecycleAt = null;
         // Slow mode: the recycle cap was reached. The watchdog stays armed
-        // but recycles no more often than stallSlowIntervalMs, until a
-        // translation token on the current stream clears it.
+        // but recycles no more often than stallSlowIntervalMs, until a closed
+        // segment on the current stream is judged to have had translation.
         this.slowMode = false;
 
         this.rotation = { phase: 'none', quietTimer: null, backstopTimer: null, tick: null, retryAfter: 0, minutes: 0, failures: 0, waitLogged: false };
@@ -340,8 +340,10 @@ export class Relay {
         this.translationConfigured = !!(config.translation && config.translation.target_language);
         const bps = bytesPerSecond(config) || 32000;
         this.buffer.capBytes = Math.max(1, Math.round((this.config.audioBufferMs / 1000) * bps));
+        const flags = resolveStartFlags(config, { langId: this.config.langId, strictHints: this.config.strictHints });
         this.log(`${this.tag} start: model=${config.model || '-'} hints=${JSON.stringify(config.language_hints || null)} `
-            + `translation=${this.translationConfigured ? (config.translation.target_language) : 'off'} endpointing=${config.enable_endpoint_detection !== false}`);
+            + `translation=${this.translationConfigured ? (config.translation.target_language) : 'off'} endpointing=${config.enable_endpoint_detection !== false} `
+            + describeStartFlags(flags));
 
         if (!this.current && !this.pending && !this.restart.timer) {
             this.lastStartDialAt = this.now();
@@ -753,16 +755,19 @@ export class Relay {
         const s = this.stall;
         if (s.seg) s.seg.hadTranslation = true;
         else if (s.lastClosed) s.lastClosed.hadTranslation = true;
-        if (this.slowMode) this.leaveSlowMode();
     }
 
-    // Translation is flowing again on the current stream: back to the normal
-    // recycle interval with a fresh cap window. lastRecycleAt is kept so the
-    // normal interval still counts from the last real recycle.
+    // A closed segment on the current stream had translation: back to the
+    // normal recycle interval. Only a judged segment counts, never a lone
+    // translation token, so a sporadic translated phrase during singing in
+    // the target language cannot drop the watchdog back to the normal
+    // interval. recycleTimes is NOT cleared: the window expires on its own,
+    // and if it still holds recycleMax recycles the next stall re-enters slow
+    // mode. lastRecycleAt is kept so the normal interval still counts from
+    // the last real recycle.
     leaveSlowMode() {
         this.slowMode = false;
-        this.recycleTimes = [];
-        this.log(`[stall] normal mode ${this.tag}: translation resumed on stream ${this.current ? this.current.index : '-'}, recycle window reset`);
+        this.log(`[stall] normal mode ${this.tag}: translated segment on stream ${this.current ? this.current.index : '-'}`);
     }
 
     onEndpoint() {
@@ -795,7 +800,11 @@ export class Relay {
         if (!seg) return;
         s.lastClosed = null;
         if (!seg.hadOriginal) return;
-        if (seg.hadTranslation) { s.streak = 0; return; }
+        if (seg.hadTranslation) {
+            s.streak = 0;
+            if (this.slowMode) this.leaveSlowMode();
+            return;
+        }
         s.streak += 1;
         if (s.streak < this.config.stallSegments) return;
         const up = this.current;
@@ -810,6 +819,14 @@ export class Relay {
         const now = this.now();
         const inWindow = this.recyclesInWindow(now);
         this.log(`[stall] ${up ? up.summaryLine() : this.tag} segments=${this.config.stallSegments} recyclesInWindow=${inWindow} slowMode=${this.slowMode}`);
+        if (!(this.config.recycleMax > 0)) {
+            // SONIOX_RECYCLE_MAX=0: never recycle for a stall. The stall is
+            // still declared and logged with its counters; nothing is dialed,
+            // slow mode is never entered, and no notice goes out because
+            // translation_stalled is only sent when a recycle follows.
+            this.log(`${this.tag} recycle suppressed (recycleMax=${this.config.recycleMax})`);
+            return;
+        }
         if (!this.slowMode && inWindow >= this.config.recycleMax) {
             // The cap used to disarm the watchdog for the rest of the
             // connection and send translation_unavailable. A speaker talking

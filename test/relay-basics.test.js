@@ -62,6 +62,45 @@ test('the Soniox api_key never appears in log output; the start config is logged
     }
 });
 
+test('the relay start line says where language_hints_strict and enable_language_identification came from, and client booleans reach Soniox', async () => {
+    const env = await setup();
+    try {
+        // Production shape: both fields omitted by the client, proxy defaults apply.
+        const a = await connectClient(env.host.url);
+        await a.start();
+        const lineA = env.host.logs.find((l) => l.startsWith('[c1] start:'));
+        assert.ok(lineA, 'start line logged');
+        assert.ok(lineA.includes('strictHints=default:true langId=default:true'), lineA);
+        assert.equal(env.mock.streams[0].startConfig.language_hints_strict, true);
+        assert.equal(env.mock.streams[0].startConfig.enable_language_identification, true);
+        a.close();
+
+        // Control run: the client pins both off for this session.
+        const b = await connectClient(env.host.url);
+        await b.start({ ...DEFAULT_CLIENT_CONFIG, language_hints_strict: false, enable_language_identification: false });
+        const lineB = env.host.logs.find((l) => l.startsWith('[c2] start:'));
+        assert.ok(lineB.includes('strictHints=client:false langId=client:false'), lineB);
+        await env.mock.waitForStreams(2);
+        assert.equal(env.mock.streams[1].startConfig.language_hints_strict, false, 'explicit false is sent, not dropped');
+        assert.equal(env.mock.streams[1].startConfig.enable_language_identification, false);
+        const cfgLine = env.host.logs.find((l) => l.includes('[stream 1] sent start config') && l.includes('[c2]'));
+        assert.ok(cfgLine.includes('"language_hints_strict":false') && cfgLine.includes('"enable_language_identification":false'), cfgLine);
+        b.close();
+
+        // Mixed: strict pinned on with several hints, language id left to the default.
+        const c = await connectClient(env.host.url);
+        await c.start({ ...DEFAULT_CLIENT_CONFIG, language_hints: ['en', 'es'], language_hints_strict: true });
+        const lineC = env.host.logs.find((l) => l.startsWith('[c3] start:'));
+        assert.ok(lineC.includes('strictHints=client:true langId=default:true'), lineC);
+        await env.mock.waitForStreams(3);
+        assert.equal(env.mock.streams[2].startConfig.language_hints_strict, true);
+        assert.equal(env.mock.streams[2].startConfig.enable_language_identification, true);
+        c.close();
+    } finally {
+        await env.teardown();
+    }
+});
+
 test('ping/pong and finalize still work; <fin> never reaches the client', async () => {
     const env = await setup();
     try {

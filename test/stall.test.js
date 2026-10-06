@@ -136,19 +136,26 @@ test('recycle: one proxy_ready, translation_stalled then stream_recycled, contin
 // translation_status none with language equal to the target, which is the
 // same shape as a real stall (English mislabeled as the target). The cap
 // therefore must not disarm the watchdog or tell the operator translation is
-// unavailable: it switches to a slow mode that keeps recycling, just rarely,
-// and drops back to normal the moment a translation token arrives.
-test('recycle cap: after recycleMax recycles in the window the watchdog enters slow mode, never sends translation_unavailable, and a translation token restores the normal interval', async () => {
+// unavailable: it switches to a slow mode that keeps recycling, just rarely.
+//
+// Leaving slow mode takes a CLOSED segment that had translation, judged when
+// the next segment begins, not a lone translation token: a sporadic translated
+// phrase inside a Spanish worship set must not drop the watchdog back to the
+// normal interval. The recycle window is never cleared on the way out; if it
+// still holds recycleMax recycles the next stall simply re-enters slow mode.
+test('recycle cap: after recycleMax recycles in the window the watchdog enters slow mode, never sends translation_unavailable, leaves only on a translated segment, keeps the window, and re-enters while the window is full', async () => {
     const slowMs = 2500;
     const env = await setup({ stallSegments: 2, recycleMax: 3, recycleWindowMs: 60000, recycleMinIntervalMs: 0, stallSlowIntervalMs: slowMs }, { stallAfterFrames: 0 });
     let pumping = true;
+    let paused = false;
     try {
         const client = await connectClient(env.host.url);
         await client.start();
         const relay = env.host.relays[0];
         // Open-ended pump (client.pump needs a frame count up front); stops on
-        // request or when the socket is no longer open.
-        const pumpLoop = (async () => { while (pumping && client.ws.readyState === 1) { client.sendAudio(); await sleep(10); } })();
+        // request or when the socket is no longer open; pauses on request so
+        // single frames can be sent by hand.
+        const pumpLoop = (async () => { while (pumping && client.ws.readyState === 1) { if (!paused) client.sendAudio(); await sleep(10); } })();
 
         // Three recycles come as fast as the min interval (0) allows; the
         // fourth stall meets the cap and enters slow mode.
@@ -170,36 +177,138 @@ test('recycle cap: after recycleMax recycles in the window the watchdog enters s
         assert.ok(relay.lastRecycleAt - thirdRecycleAt >= slowMs, `slow recycle waited ${relay.lastRecycleAt - thirdRecycleAt} ms, expected >= ${slowMs}`);
         const fourthRecycleAt = relay.lastRecycleAt;
         assert.equal(relay.slowMode, true, 'still slow: the replacement stalls too');
+        assert.equal(relay.recycleTimes.length, 4, 'four recycles inside the window');
         await sleep(800);
         assert.equal(env.mock.streams.length, 5, 'only one recycle per slow interval');
 
-        // A translation token on the current stream ends slow mode. The next
-        // stall then recycles on the normal interval, well inside what would
-        // have been the slow interval.
+        // One translated frame = original + translation + <end>: the segment
+        // closes but is not judged until the next segment begins, so slow mode
+        // must still be on after it.
+        paused = true;
+        await sleep(60);
         const live = env.mock.streams[4];
+        assert.equal(relay.current.index, 5);
         live.behavior.stallAfterFrames = null;
-        await waitUntil(() => relay.slowMode === false, 2000, 'slow mode not left after a translation token');
-        assert.deepEqual(relay.recycleTimes, [], 'fresh recycle window');
-        assert.ok(env.host.logs.some((l) => l.startsWith('[stall] normal mode')), 'leaving slow mode is logged');
-        await sleep(100);
+        client.sendAudio();
+        await sleep(150);
+        assert.equal(relay.slowMode, true, 'a translation token alone does not leave slow mode');
+        assert.equal(env.host.logs.some((l) => l.startsWith('[stall] normal mode')), false);
+
+        // The next segment judges the closed translated one: now slow mode ends,
+        // and the recycle window is kept as it is.
+        client.sendAudio();
+        await waitUntil(() => relay.slowMode === false, 2000, 'slow mode not left after a translated segment closed');
+        assert.equal(relay.recycleTimes.length, 4, 'recycleTimes retained: the window expires on its own');
+        assert.equal(relay.lastRecycleAt, fourthRecycleAt, 'lastRecycleAt kept');
+        const normalLines = env.host.logs.filter((l) => l.startsWith('[stall] normal mode'));
+        assert.equal(normalLines.length, 1, 'leaving slow mode is logged once');
+        assert.ok(normalLines[0].includes('translated segment on stream 5'), normalLines[0]);
+
+        // The window still holds recycleMax recycles, so the next stall
+        // re-enters slow mode instead of recycling on the normal interval.
         live.behavior.stallAfterFrames = 0;
-        await env.mock.waitForStreams(6, 2000);
-        assert.ok(relay.lastRecycleAt - fourthRecycleAt < slowMs, `normal interval restored: recycled ${relay.lastRecycleAt - fourthRecycleAt} ms after the slow recycle`);
+        paused = false;
+        await waitUntil(() => relay.slowMode === true, 2000, 'slow mode not re-entered while the window is full');
+        assert.equal(env.host.logs.filter((l) => l.startsWith('[stall] slow mode')).length, 2, '[stall] slow mode logged again on re-entry');
+        await sleep(400);
+        assert.equal(env.mock.streams.length, 5, 'no recycle on the normal interval after re-entry');
+        assert.equal(relay.lastRecycleAt, fourthRecycleAt, 'the slow interval still counts from the last real recycle');
 
         pumping = false;
         await pumpLoop;
         await sleep(150);
         const notices = client.notices();
         assert.equal(notices.includes('translation_unavailable'), false, 'translation_unavailable is never sent from the stall path');
-        assert.equal(notices.filter((n) => n === 'translation_stalled').length, 5, 'five recycles in total');
-        assert.equal(notices.filter((n) => n === 'stream_recycled').length, 5, 'every translation_stalled was followed by a recycle');
-        assert.equal(env.mock.streams.length, 6);
+        assert.equal(notices.filter((n) => n === 'translation_stalled').length, 4, 'four recycles in total');
+        assert.equal(notices.filter((n) => n === 'stream_recycled').length, 4, 'every translation_stalled was followed by a recycle');
+        assert.equal(env.mock.streams.length, 5);
         assert.equal(client.ofType('proxy_ready').length, 1);
         assert.equal(client.closeCode, null, 'captions keep flowing; the client stays connected');
         assert.equal(env.mock.totalAudioBytes(), client.sentAudioBytes());
         client.close();
     } finally {
         pumping = false;
+        await env.teardown();
+    }
+});
+
+// The other way out of the window: time. With a window shorter than the slow
+// interval, the three fast recycles have expired by the time the slow recycle
+// happens, so once a translated segment ends slow mode the next stall recycles
+// on the normal interval again. Nothing is cleared to get there.
+test('recycle cap: after slow mode ends, a stall recycles on the normal interval once the window has expired on its own', async () => {
+    const slowMs = 2500;
+    const env = await setup({ stallSegments: 2, recycleMax: 3, recycleWindowMs: 2000, recycleMinIntervalMs: 0, stallSlowIntervalMs: slowMs }, { stallAfterFrames: 0 });
+    let pumping = true;
+    try {
+        const client = await connectClient(env.host.url);
+        await client.start();
+        const relay = env.host.relays[0];
+        const pumpLoop = (async () => { while (pumping && client.ws.readyState === 1) { client.sendAudio(); await sleep(10); } })();
+
+        await waitUntil(() => relay.slowMode === true, 4000, 'slow mode not entered');
+        assert.equal(env.mock.streams.length, 4);
+        await env.mock.waitForStreams(5, slowMs + 2000);
+        const slowRecycleAt = relay.lastRecycleAt;
+        assert.equal(relay.slowMode, true);
+        assert.equal(relay.recycleTimes.length, 1, 'the three fast recycles have left the window; only the slow one remains');
+
+        // Translation resumes on the live stream: the next segment judges a
+        // translated one and slow mode ends with the window untouched.
+        const live = env.mock.streams[4];
+        live.behavior.stallAfterFrames = null;
+        await waitUntil(() => relay.slowMode === false, 2000, 'slow mode not left');
+        assert.equal(relay.recycleTimes.length, 1, 'recycleTimes retained');
+
+        // Stall again: one recycle in the window is under the cap, so the
+        // normal interval (0) applies and the recycle comes at once.
+        live.behavior.stallAfterFrames = 0;
+        await env.mock.waitForStreams(6, 2000);
+        assert.ok(relay.lastRecycleAt - slowRecycleAt < slowMs, `normal interval restored: recycled ${relay.lastRecycleAt - slowRecycleAt} ms after the slow recycle`);
+        assert.equal(relay.slowMode, false);
+        assert.equal(env.host.logs.filter((l) => l.startsWith('[stall] slow mode')).length, 1, 'no re-entry: the window was under the cap');
+
+        pumping = false;
+        await pumpLoop;
+        await sleep(150);
+        assert.equal(client.notices().filter((n) => n === 'translation_stalled').length, 5);
+        assert.equal(client.notices().filter((n) => n === 'stream_recycled').length, 5);
+        assert.equal(client.notices().includes('translation_unavailable'), false);
+        assert.equal(env.mock.totalAudioBytes(), client.sentAudioBytes());
+        client.close();
+    } finally {
+        pumping = false;
+        await env.teardown();
+    }
+});
+
+// SONIOX_RECYCLE_MAX=0 means "never recycle for a stall": stalls are still
+// declared and logged (the counters are the point), but nothing is dialed,
+// slow mode is never entered, and translation_stalled is not sent because no
+// recycle follows it.
+test('recycleMax=0: stalls are declared and logged but never recycled, no slow mode, no notice', async () => {
+    const env = await setup({ stallSegments: 2, recycleMax: 0, recycleMinIntervalMs: 0, stallSlowIntervalMs: 0 }, { stallAfterFrames: 0 });
+    try {
+        const client = await connectClient(env.host.url);
+        await client.start();
+        const relay = env.host.relays[0];
+        await client.pump(30, 10);
+        await sleep(150);
+        const stallLines = env.host.logs.filter((l) => l.startsWith('[stall] [') && l.includes('recyclesInWindow='));
+        assert.ok(stallLines.length >= 2, `stalls keep being declared and logged (${stallLines.length})`);
+        const suppressed = env.host.logs.filter((l) => l.includes('recycle suppressed (recycleMax=0)'));
+        assert.equal(suppressed.length, stallLines.length, 'every declared stall is suppressed with the recycleMax=0 reason');
+        assert.equal(env.host.logs.some((l) => l.startsWith('[stall] slow mode')), false, 'slow mode is never entered');
+        assert.equal(relay.slowMode, false);
+        assert.equal(relay.lastRecycleAt, null);
+        assert.deepEqual(relay.recycleTimes, []);
+        assert.equal(env.mock.streams.length, 1, 'no recycle, not even one');
+        assert.equal(relay.current.index, 1);
+        assert.deepEqual(client.notices(), [], 'translation_stalled is only sent when a recycle follows');
+        assert.equal(client.closeCode, null);
+        assert.equal(env.mock.totalAudioBytes(), client.sentAudioBytes());
+        client.close();
+    } finally {
         await env.teardown();
     }
 });

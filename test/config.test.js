@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildSonioxConfig, redactConfig, bytesPerSecond, isErrorFrame, UpstreamError, DEFAULT_SONIOX_WS_URL } from '../upstream.js';
+import { buildSonioxConfig, resolveStartFlags, describeStartFlags, redactConfig, bytesPerSecond, isErrorFrame, UpstreamError, DEFAULT_SONIOX_WS_URL } from '../upstream.js';
 import { readRelayConfig } from '../relay.js';
 
 const KEY = 'sk-test-not-real';
@@ -24,6 +24,64 @@ test('language_hints_strict is sent only when the client sent exactly one hint',
 
     const off = buildSonioxConfig({ language_hints: ['en'] }, KEY, { strictHints: false });
     assert.equal('language_hints_strict' in off, false);
+});
+
+// Control runs: a client may pin language_hints_strict for one session. An
+// explicit boolean wins over the proxy default in both directions and
+// regardless of the hint count or SONIOX_STRICT_HINTS; anything that is not
+// a boolean is "omitted" and the default applies. Both production clients
+// omit the field, so their start request is unchanged.
+test('an explicit boolean language_hints_strict from the client is honored over the proxy default', () => {
+    const clientOff = buildSonioxConfig({ language_hints: ['en'], language_hints_strict: false }, KEY);
+    assert.equal(clientOff.language_hints_strict, false, 'client false beats the one-hint default of true');
+    assert.equal('language_hints_strict' in clientOff, true, 'sent explicitly so the Soniox log shows it');
+
+    const clientOnManyHints = buildSonioxConfig({ language_hints: ['en', 'es'], language_hints_strict: true }, KEY);
+    assert.equal(clientOnManyHints.language_hints_strict, true, 'client true beats the several-hints default of unset');
+
+    const clientOnEnvOff = buildSonioxConfig({ language_hints: ['en'], language_hints_strict: true }, KEY, { strictHints: false });
+    assert.equal(clientOnEnvOff.language_hints_strict, true, 'client true beats SONIOX_STRICT_HINTS=off');
+
+    const clientOffNoHints = buildSonioxConfig({ language_hints_strict: false }, KEY);
+    assert.equal(clientOffNoHints.language_hints_strict, false);
+
+    for (const notBoolean of ['false', 'true', 0, 1, null]) {
+        const cfg = buildSonioxConfig({ language_hints: ['en'], language_hints_strict: notBoolean }, KEY);
+        assert.equal(cfg.language_hints_strict, true, `${JSON.stringify(notBoolean)} is not an explicit boolean: default applies`);
+    }
+
+    assert.deepEqual(resolveStartFlags({ language_hints: ['en'] }, {}).strictHints, { source: 'default', value: true });
+    assert.deepEqual(resolveStartFlags({ language_hints: ['en', 'es'] }, {}).strictHints, { source: 'default', value: false });
+    assert.deepEqual(resolveStartFlags({ language_hints: ['en'] }, { strictHints: false }).strictHints, { source: 'default', value: false });
+    assert.deepEqual(resolveStartFlags({ language_hints: ['en'], language_hints_strict: false }, {}).strictHints, { source: 'client', value: false });
+    assert.deepEqual(resolveStartFlags({ language_hints: ['en', 'es'], language_hints_strict: true }, {}).strictHints, { source: 'client', value: true });
+});
+
+test('an explicit boolean enable_language_identification from the client is honored over the proxy default', () => {
+    const clientOff = buildSonioxConfig({ enable_language_identification: false }, KEY);
+    assert.equal(clientOff.enable_language_identification, false, 'client false beats the default of true');
+    assert.equal('enable_language_identification' in clientOff, true, 'sent explicitly so the Soniox log shows it');
+
+    const clientOnEnvOff = buildSonioxConfig({ enable_language_identification: true }, KEY, { langId: false });
+    assert.equal(clientOnEnvOff.enable_language_identification, true, 'client true beats SONIOX_LANG_ID=off');
+
+    for (const notBoolean of ['false', 'off', 0, null]) {
+        const cfg = buildSonioxConfig({ enable_language_identification: notBoolean }, KEY);
+        assert.equal(cfg.enable_language_identification, true, `${JSON.stringify(notBoolean)} is not an explicit boolean: default applies`);
+    }
+    assert.equal('enable_language_identification' in buildSonioxConfig({ enable_language_identification: 'off' }, KEY, { langId: false }), false);
+
+    assert.deepEqual(resolveStartFlags({}, {}).langId, { source: 'default', value: true });
+    assert.deepEqual(resolveStartFlags({}, { langId: false }).langId, { source: 'default', value: false });
+    assert.deepEqual(resolveStartFlags({ enable_language_identification: false }, {}).langId, { source: 'client', value: false });
+    assert.deepEqual(resolveStartFlags({ enable_language_identification: true }, { langId: false }).langId, { source: 'client', value: true });
+});
+
+test('describeStartFlags is the start-line wording: strictHints=<source>:<value> langId=<source>:<value>', () => {
+    assert.equal(describeStartFlags(resolveStartFlags({ language_hints: ['en'] }, {})), 'strictHints=default:true langId=default:true');
+    assert.equal(describeStartFlags(resolveStartFlags({ language_hints: ['en', 'es'] }, { langId: false })), 'strictHints=default:false langId=default:false');
+    assert.equal(describeStartFlags(resolveStartFlags({ language_hints: ['en'], language_hints_strict: false, enable_language_identification: false }, {})), 'strictHints=client:false langId=client:false');
+    assert.equal(describeStartFlags(resolveStartFlags({ language_hints: ['en', 'es'], language_hints_strict: true }, {})), 'strictHints=client:true langId=default:true');
 });
 
 test('translation keeps type and target_language and drops source_language', () => {

@@ -84,8 +84,8 @@ Run the suite with `npm test` (uses the mock in `test/mock-soniox.js`).
 | Variable | Default | What it does |
 |---|---|---|
 | `SONIOX_WS_URL` | `wss://stt-rt.soniox.com/transcribe-websocket` | Upstream endpoint. Tests point it at the mock. |
-| `SONIOX_LANG_ID` | `on` | Sends `enable_language_identification: true` so tokens carry `language`. |
-| `SONIOX_STRICT_HINTS` | `on` | Sends `language_hints_strict: true` when the client sent exactly one hint. |
+| `SONIOX_LANG_ID` | `on` | Sends `enable_language_identification: true` so tokens carry `language`. An explicit boolean `enable_language_identification` in the client's start config wins over this default, true or false (control runs); both production clients omit it. The start line logs `langId=client:<value>` or `langId=default:<value>`. |
+| `SONIOX_STRICT_HINTS` | `on` | Sends `language_hints_strict: true` when the client sent exactly one hint. An explicit boolean `language_hints_strict` in the client's start config wins over this default, true or false, whatever the hint count (control runs); both production clients omit it. The start line logs `strictHints=client:<value>` or `strictHints=default:<value>`. |
 | `SONIOX_KEEPALIVE_MS` | `10000` | After this long without audio, send `{"type":"keepalive"}` at this interval until audio resumes. |
 | `SONIOX_STALL_WATCHDOG` | `on` | Detect "finals but no translation" and recycle the stream (translation sessions only). |
 | `SONIOX_STALL_SEGMENTS` | `6` | Consecutive untranslated segments before a stall is declared. |
@@ -93,9 +93,9 @@ Run the suite with `npm test` (uses the mock in `test/mock-soniox.js`).
 | `SONIOX_STALL_COUNT_NONE` | `on` | Count finals tagged `translation_status: none` (speech Soniox judged outside the pair, so no translation follows) as untranslated segments. |
 | `SONIOX_SEGMENT_GAP_MS` | `700` | Without an `<end>` token, a run of finals followed by this much silence closes a segment. |
 | `SONIOX_RECYCLE_MIN_INTERVAL_MS` | `120000` | At most one stall recycle per client in this window (normal mode). |
-| `SONIOX_RECYCLE_MAX` | `3` | Stall recycles allowed per `SONIOX_RECYCLE_WINDOW_MS`; past it the watchdog enters slow mode (see `SONIOX_STALL_SLOW_INTERVAL_MS`). Nothing is sent to the client for the cap itself. |
-| `SONIOX_RECYCLE_WINDOW_MS` | `600000` | Window for `SONIOX_RECYCLE_MAX`. |
-| `SONIOX_STALL_SLOW_INTERVAL_MS` | `600000` | Slow mode: once `SONIOX_RECYCLE_MAX` recycles have happened inside the window, the watchdog stays armed but recycles no more often than this (10 minutes). Slow mode ends, with a fresh window, as soon as a translation token arrives on the current stream. Speech or singing in the target language looks like a stall to the watchdog (finals tagged `none`, no translation), so this is what stops a Spanish worship set from recycling every two minutes while a real stall later in the same session is still caught. Logged once as `[stall] slow mode`. |
+| `SONIOX_RECYCLE_MAX` | `3` | Stall recycles allowed per `SONIOX_RECYCLE_WINDOW_MS`; past it the watchdog enters slow mode (see `SONIOX_STALL_SLOW_INTERVAL_MS`). Nothing is sent to the client for the cap itself. `0` means never recycle for a stall: stalls are still declared and logged with their counters, then `recycle suppressed (recycleMax=0)` is logged; no stream is dialed, slow mode is never entered, and no `translation_stalled` goes out (it is only sent when a recycle follows). Use it to watch the counters on a live session without any automatic stream switch. |
+| `SONIOX_RECYCLE_WINDOW_MS` | `600000` | Window for `SONIOX_RECYCLE_MAX`. It is never cleared; entries simply age out. |
+| `SONIOX_STALL_SLOW_INTERVAL_MS` | `600000` | Slow mode: once `SONIOX_RECYCLE_MAX` recycles have happened inside the window, the watchdog stays armed but recycles no more often than this (10 minutes). Slow mode ends when a closed segment on the current stream is judged to have had translation (a lone translation token is not enough), logged as `[stall] normal mode`; the recycle window is kept, so if it still holds `SONIOX_RECYCLE_MAX` recycles the next stall re-enters slow mode (logged again as `[stall] slow mode`). Speech or singing in the target language looks like a stall to the watchdog (finals tagged `none`, no translation), so this is what stops a Spanish worship set from recycling every two minutes while a real stall later in the same session is still caught. |
 | `SONIOX_ROTATION` | `on` | Roll to a fresh upstream before the fixed 300 minute cap. |
 | `SONIOX_ROTATE_SOFT_MIN` | `270` | Minutes (max of audio and wall) at which the replacement is pre-dialed and the switch waits for the next endpoint. |
 | `SONIOX_ROTATE_HARD_MIN` | `290` | Minutes at which the switch happens immediately. |

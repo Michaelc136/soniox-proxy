@@ -26,14 +26,37 @@ export function bytesPerSecond(clientConfig = {}) {
     return bytes * rate * channels;
 }
 
+// Where language_hints_strict and enable_language_identification come from
+// and what they are. An explicit boolean in the client's start config wins,
+// true or false, so a control run can pin either for one session; anything
+// else (absent, null, a string) is "omitted" and the proxy default applies:
+// strict when exactly one hint was sent and SONIOX_STRICT_HINTS is on,
+// language identification when SONIOX_LANG_ID is on. Both production clients
+// omit both fields, so their start request is unchanged.
+export function resolveStartFlags(clientConfig = {}, opts = {}) {
+    const clientHints = Array.isArray(clientConfig.language_hints) ? clientConfig.language_hints : null;
+    const strictHints = typeof clientConfig.language_hints_strict === 'boolean'
+        ? { source: 'client', value: clientConfig.language_hints_strict }
+        : { source: 'default', value: opts.strictHints !== false && !!clientHints && clientHints.length === 1 };
+    const langId = typeof clientConfig.enable_language_identification === 'boolean'
+        ? { source: 'client', value: clientConfig.enable_language_identification }
+        : { source: 'default', value: opts.langId !== false };
+    return { strictHints, langId };
+}
+
+// The wording on the relay's start line, e.g. `strictHints=default:true langId=client:false`.
+export function describeStartFlags(flags) {
+    return `strictHints=${flags.strictHints.source}:${flags.strictHints.value} langId=${flags.langId.source}:${flags.langId.value}`;
+}
+
 // Builds the start request Soniox expects from the config the client sent.
 // Mirrors the a171dfd shape field for field, with the reliability changes:
 // language_hints_strict when the client sent exactly one hint,
-// enable_language_identification so tokens carry `language`, and no
-// undocumented translation.source_language.
+// enable_language_identification so tokens carry `language` (both subject to
+// a client-pinned boolean, see resolveStartFlags), and no undocumented
+// translation.source_language.
 export function buildSonioxConfig(clientConfig, apiKey, opts = {}) {
-    const langId = opts.langId !== false;
-    const strictHints = opts.strictHints !== false;
+    const flags = resolveStartFlags(clientConfig, opts);
     const clientHints = Array.isArray(clientConfig.language_hints) ? clientConfig.language_hints : null;
 
     const sonioxConfig = {
@@ -52,11 +75,14 @@ export function buildSonioxConfig(clientConfig, apiKey, opts = {}) {
         max_non_final_tokens_duration_ms: clientConfig.max_non_final_tokens_duration_ms || 4000,
     };
 
-    if (strictHints && clientHints && clientHints.length === 1) {
-        sonioxConfig.language_hints_strict = true;
+    // A client-pinned value is sent as is, false included, so the redacted
+    // config line shows exactly what the control run asked for. The default
+    // only ever adds the field when it is true, as before.
+    if (flags.strictHints.source === 'client' || flags.strictHints.value) {
+        sonioxConfig.language_hints_strict = flags.strictHints.value;
     }
-    if (langId) {
-        sonioxConfig.enable_language_identification = true;
+    if (flags.langId.source === 'client' || flags.langId.value) {
+        sonioxConfig.enable_language_identification = flags.langId.value;
     }
 
     const translation = clientConfig.translation;
