@@ -13,8 +13,11 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
+import { startMockSoniox } from '../mock-soniox.js';
+import { startRelayHost, fastConfig, TEST_API_KEY } from '../helpers.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
+const FAKE_JWT = 'selftest-jwt-not-real';
 const SCRIPT = path.join(HERE, 'reproduce-stall.js');
 const SUMMARIZE = path.join(HERE, 'summarize.js');
 const BYTES_PER_SECOND = 32000;
@@ -212,6 +215,158 @@ test('harness: a rejected start request is recorded as an error frame and exits 
     assert.equal(s.errors[0].error_type, 'unauthenticated');
     assert.equal(s.translation_resumed, false);
     assert.equal(s.stall_reproduced, false);
+});
+
+// Proxy mode runs through the real relay (helpers.startRelayHost: auth_success,
+// then a Relay per client, exactly what server.js does after the JWT check)
+// with the mock Soniox behind it, so the proxy protocol is exercised end to end.
+test('harness proxy mode: auth_success, studio-shaped start, one proxy_ready, notices and tail, no secrets in files', async (t) => {
+    const mock = await startMockSoniox();
+    t.after(() => mock.close());
+    // Stream 1 dies after 8 audio frames: the relay buffers, re-dials, adopts
+    // stream 2 and sends one stream_recycled notice. The run still completes.
+    mock.setStream(1, { dropAfterFrames: 8 });
+    const host = await startRelayHost(fastConfig(mock.url));
+    t.after(() => host.close());
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'soniox-harness-selftest-'));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const audioDir = makeAudio(dir);
+
+    const res = await run(SCRIPT, ['--audio-dir', audioDir, '--out-dir', dir, '--condition', 'A', '--via-proxy', host.url, '--label', 'A-proxy-selftest'],
+        { HARNESS_JWT: FAKE_JWT });
+    assert.equal(res.code, 0, res.stderr);
+    assert.ok(!res.stderr.includes(FAKE_JWT), 'stderr must not contain the jwt');
+    assert.ok(!res.stderr.includes(TEST_API_KEY), 'stderr must not contain the api key');
+
+    // What the proxy sent upstream: the key and the strict/langId flags come from the proxy, not the harness.
+    await mock.waitForStreams(2);
+    for (const stream of mock.streams) {
+        const cfg = stream.startConfig;
+        assert.equal(cfg.api_key, TEST_API_KEY);
+        assert.equal(cfg.language_hints_strict, true);
+        assert.equal(cfg.enable_language_identification, true);
+        assert.deepEqual(cfg.language_hints, ['en']);
+        assert.equal(cfg.translation.target_language, 'es');
+        assert.equal(cfg.translation.source_language, undefined, 'the proxy strips source_language');
+        assert.equal(cfg.client_reference_id, undefined);
+    }
+    assert.ok(mock.streams[1].audioFrames > 0, 'audio continued on the replacement stream');
+
+    const s = JSON.parse(fs.readFileSync(path.join(dir, 'A-proxy-selftest.summary.json'), 'utf8'));
+    assert.equal(s.mode, 'proxy');
+    assert.ok(s.proxy_url.startsWith(host.url));
+    assert.equal(s.soniox_url, null);
+    assert.equal(s.strict, null);
+    assert.equal(s.start_failed, false);
+    assert.equal(s.failed, false);
+    assert.equal(s.failure_reason, null);
+    assert.equal(s.proxy_ready_count, 1);
+    assert.ok(s.auth_success_wall_ms != null && s.ack_wall_ms >= s.auth_success_wall_ms);
+    assert.equal(s.completed_audio, true);
+    assert.equal(s.audio_seconds_sent, 3);
+    assert.equal(s.close.code, 1000);
+    assert.equal(s.finished, false, 'the proxy never forwards a finished frame');
+    assert.equal(s.fin_tokens, 0, 'the proxy strips <fin>');
+    assert.ok(s.tokens_total >= 20, `tokens ${s.tokens_total}`);
+    assert.ok(s.phases.pre.finals_translation >= 3, `pre translations ${s.phases.pre.finals_translation}`);
+    assert.equal(s.errors.length, 0);
+    assert.equal(s.proxy_error_frames, 0);
+    assert.deepEqual(s.proxy_notice_counts, { stream_recycled: 1 });
+    assert.equal(s.proxy_notices.length, 1);
+    assert.equal(s.proxy_notices[0].notice, 'stream_recycled');
+    assert.equal(typeof s.proxy_notices[0].t_wall_ms, 'number');
+    assert.equal(typeof s.proxy_notices[0].audio_sent_ms, 'number');
+    // The config the harness sent is the studio's shape: nothing the proxy owns.
+    assert.deepEqual(Object.keys(s.config).sort(), ['audio_format', 'enable_endpoint_detection', 'include_nonfinal', 'language_hints', 'model', 'sample_rate', 'translation']);
+    assert.deepEqual(s.config.translation, { source_language: 'en', target_language: 'es', type: 'one_way' });
+
+    const raw = fs.readFileSync(path.join(dir, 'A-proxy-selftest.tokens.jsonl'), 'utf8');
+    assert.ok(!raw.includes(FAKE_JWT), 'token log must not contain the jwt');
+    assert.ok(!raw.includes(TEST_API_KEY), 'token log must not contain the api key');
+    const lines = raw.trim().split('\n').map((l) => JSON.parse(l));
+    assert.equal(lines[0].type, 'meta');
+    assert.equal(lines[0].mode, 'proxy');
+    assert.equal(lines[0].endpoint, s.proxy_url);
+    const events = lines.filter((l) => l.type === 'event');
+    const names = events.map((l) => l.event);
+    for (const e of ['open', 'auth_success', 'start_sent', 'proxy_ready', 'streaming_start', 'audio_done', 'finalize_sent', 'tail_done', 'close']) {
+        assert.ok(names.includes(e), `missing event ${e}`);
+    }
+    assert.equal(names.filter((e) => e === 'proxy_ready').length, 1);
+    const notice = events.find((l) => l.event === 'proxy_notice');
+    assert.equal(notice.notice, 'stream_recycled');
+    assert.equal(typeof notice.t_wall_ms, 'number');
+    assert.ok(lines.filter((l) => l.type === 'token').length >= 20);
+
+    const sum = await run(SUMMARIZE, [dir], {});
+    assert.equal(sum.code, 0, sum.stderr);
+    const md = fs.readFileSync(path.join(dir, 'summary.md'), 'utf8');
+    assert.match(md, /through the Selah proxy/);
+    assert.match(md, /stream_recycled:1/);
+    assert.match(md, /proxy_ready x1/);
+    assert.ok(!md.includes(FAKE_JWT));
+    const matrix = JSON.parse(fs.readFileSync(path.join(dir, 'matrix.json'), 'utf8'));
+    assert.equal(matrix.runs[0].mode, 'proxy');
+    assert.equal(matrix.runs[0].proxy_ready_count, 1);
+    assert.equal(matrix.runs[0].failed, false);
+});
+
+test('harness proxy mode: an exhausted re-dial is a run failure with the 1011 reason and exit 4', async (t) => {
+    const mock = await startMockSoniox();
+    t.after(() => mock.close());
+    mock.setStream(1, { dropAfterFrames: 5 });
+    mock.setStream(2, { refuseConnection: true });
+    mock.setStream(3, { refuseConnection: true });
+    const host = await startRelayHost(fastConfig(mock.url));
+    t.after(() => host.close());
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'soniox-harness-selftest-'));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const audioDir = makeAudio(dir);
+
+    const res = await run(SCRIPT, ['--audio-dir', audioDir, '--out-dir', dir, '--condition', 'A', '--via-proxy', host.url, '--label', 'A-proxy-loss-selftest'],
+        { HARNESS_JWT: FAKE_JWT });
+    assert.equal(res.code, 4, res.stderr);
+    const s = JSON.parse(fs.readFileSync(path.join(dir, 'A-proxy-loss-selftest.summary.json'), 'utf8'));
+    assert.equal(s.proxy_ready_count, 1);
+    assert.equal(s.start_failed, false);
+    assert.equal(s.failed, true);
+    assert.match(s.failure_reason, /1011/);
+    assert.match(s.failure_reason, /upstream failed/);
+    assert.equal(s.completed_audio, false);
+    assert.equal(s.close.code, 1011);
+    assert.equal(s.proxy_error_frames, 1);
+    assert.equal(s.errors[0].source, 'proxy');
+    assert.equal(s.errors[0].code, 1011);
+    assert.equal(typeof s.errors[0].t_wall_ms, 'number');
+    const names = s.events.map((e) => e.event);
+    assert.ok(names.includes('error_frame'));
+    assert.ok(names.includes('run_failed'));
+    const raw = fs.readFileSync(path.join(dir, 'A-proxy-loss-selftest.tokens.jsonl'), 'utf8');
+    assert.ok(raw.split('\n').some((l) => l.includes('"event":"error_frame"') && l.includes('"source":"proxy"')));
+});
+
+test('harness proxy mode: refuses --strict, requires HARNESS_JWT, and never needs SONIOX_API_KEY', async () => {
+    const base = { ...process.env, SONIOX_WS_URL: 'ws://127.0.0.1:9' };
+    delete base.SONIOX_API_KEY;
+    delete base.HARNESS_JWT;
+    const spawnHarness = (args, env) => new Promise((resolve) => {
+        const childEnv = { ...env };
+        delete childEnv.NODE_TEST_CONTEXT;
+        const child = spawn(process.execPath, [SCRIPT, ...args], { env: childEnv, stdio: ['ignore', 'pipe', 'pipe'] });
+        let stderr = '';
+        child.stderr.on('data', (d) => { stderr += d; });
+        child.on('exit', (code) => resolve({ code, stderr }));
+    });
+    const strict = await spawnHarness(['--condition', 'A', '--via-proxy', 'ws://127.0.0.1:9', '--strict'], { ...base, HARNESS_JWT: FAKE_JWT });
+    assert.equal(strict.code, 2);
+    assert.match(strict.stderr, /--strict cannot be combined with --via-proxy/);
+    const noJwt = await spawnHarness(['--condition', 'A', '--via-proxy', 'ws://127.0.0.1:9'], base);
+    assert.equal(noJwt.code, 2);
+    assert.match(noJwt.stderr, /HARNESS_JWT is not set/);
+    assert.ok(!noJwt.stderr.includes('SONIOX_API_KEY'));
+    const badUrl = await spawnHarness(['--condition', 'A', '--via-proxy', 'https://example.com'], { ...base, HARNESS_JWT: FAKE_JWT });
+    assert.equal(badUrl.code, 2);
+    assert.match(badUrl.stderr, /ws:\/\/ or wss:\/\//);
 });
 
 test('harness: missing SONIOX_API_KEY exits 2 without connecting', async () => {

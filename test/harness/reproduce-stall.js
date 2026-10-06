@@ -2,27 +2,42 @@
 /**
  * Soniox translation-stall reproduction harness.
  *
- * Connects DIRECTLY to Soniox (no proxy) with the same start config the proxy
- * sends (plus enable_language_identification so tokens carry `language`),
- * streams 16 kHz PCM at real-time pace in 100 ms frames through three phases
- * (English speech, a long gap, English speech) and writes every token to a
- * JSONL file with text, is_final, language, translation_status,
+ * Direct mode connects straight to Soniox (no proxy) with the same start config
+ * the proxy sends (plus enable_language_identification so tokens carry
+ * `language`), streams 16 kHz PCM at real-time pace in 100 ms frames through
+ * three phases (English speech, a long gap, English speech) and writes every
+ * token to a JSONL file with text, is_final, language, translation_status,
  * source_language, wall time and audio time. A per-run summary JSON records
  * final-token counts per phase split by translation_status, languages seen,
  * whether translation resumed after the gap, time to the first post-gap
  * translation, and every error frame.
  *
- * The API key is read from the SONIOX_API_KEY environment variable only and
- * is never written to any file or log.
+ * Proxy mode (--via-proxy <ws(s)-url>) speaks the Selah proxy's client protocol
+ * instead, so the run uses the key the proxy holds: connect with
+ * ?token=<Supabase JWT> (env HARNESS_JWT), wait for {"type":"auth_success"},
+ * send {"action":"start","config":{...}} in the exact shape the web studio
+ * sends, wait for {"type":"proxy_ready"}, then stream. The proxy injects
+ * api_key, language_hints_strict and enable_language_identification itself, so
+ * proxy mode never sends those and --strict is refused. {"type":"proxy_notice"}
+ * and {"type":"error"} frames are logged to the JSONL with timestamps and
+ * counted in the summary; a second proxy_ready is logged as a duplicate; a 1011
+ * close is recorded as a run failure with its reason.
+ *
+ * Credentials are read from the environment only (SONIOX_API_KEY in direct
+ * mode, HARNESS_JWT in proxy mode) and are never written to any file or log.
  *
  * Usage:
  *   SONIOX_API_KEY=... node reproduce-stall.js --condition A|B|C [--strict] [--smoke]
  *       [--out-dir DIR] [--audio-dir DIR] [--pre-seconds N] [--gap-seconds N]
  *       [--post-seconds N] [--model stt-rt-v5] [--target es] [--no-source-language]
  *       [--label NAME]
+ *   HARNESS_JWT=... node reproduce-stall.js --condition A|B|C --via-proxy wss://host [--smoke] [options]
  *
  * Conditions: A gap = digital silence, B gap = synthetic instrumental,
  * C gap = Spanish speech. Audio files come from gen-audio.sh.
+ *
+ * Exit codes: 0 all audio sent, 2 audio incomplete, 3 start failed (no ack or
+ * no proxy_ready), 4 proxy mode loss (the proxy closed with 1011).
  */
 
 import fs from 'node:fs';
@@ -40,6 +55,8 @@ const DEFAULT_OUT = '/private/tmp/claude-501/-Users-michaelcolley/09c687da-aa28-
 const SONIOX_URL = process.env.SONIOX_WS_URL || 'wss://stt-rt.soniox.com/transcribe-websocket';
 const ACK_TIMEOUT_MS = 15000;
 const FINISH_TIMEOUT_MS = 15000;
+const PROXY_READY_TIMEOUT_MS = 30000; // start sent -> proxy dials Soniox -> ack -> proxy_ready
+const PROXY_TAIL_MS = 3000;           // after finalize, wait this long for the tail, then close
 const PROGRESS_MS = 60000;
 const UPSTREAM_SILENT_WARN_MS = 60000;
 const WS_OPEN = 1;
@@ -53,6 +70,7 @@ const GAP = {
 function usage(message) {
     if (message) console.error(`error: ${message}`);
     console.error('usage: SONIOX_API_KEY=... node reproduce-stall.js --condition A|B|C [--strict] [--smoke] [options]');
+    console.error('       HARNESS_JWT=... node reproduce-stall.js --condition A|B|C --via-proxy wss://host [--smoke] [options]');
     process.exit(2);
 }
 
@@ -60,7 +78,7 @@ function parseArgs(argv) {
     const o = {
         condition: null, strict: false, smoke: false, outDir: DEFAULT_OUT, audioDir: null,
         model: 'stt-rt-v5', target: 'es', preSeconds: null, gapSeconds: null, postSeconds: null,
-        sourceLanguage: true, label: null,
+        sourceLanguage: true, label: null, viaProxy: null,
     };
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i];
@@ -72,6 +90,7 @@ function parseArgs(argv) {
             case '--condition': o.condition = next().toUpperCase(); break;
             case '--strict': o.strict = true; break;
             case '--smoke': o.smoke = true; break;
+            case '--via-proxy': o.viaProxy = next(); break;
             case '--out-dir': o.outDir = next(); break;
             case '--audio-dir': o.audioDir = next(); break;
             case '--model': o.model = next(); break;
@@ -86,13 +105,19 @@ function parseArgs(argv) {
         }
     }
     if (!GAP[o.condition]) usage('--condition must be A, B or C');
+    if (o.viaProxy) {
+        if (o.strict) usage('--strict cannot be combined with --via-proxy: the proxy sets language_hints_strict itself');
+        let ok = false;
+        try { ok = /^wss?:$/.test(new URL(o.viaProxy).protocol); } catch { ok = false; }
+        if (!ok) usage('--via-proxy needs a ws:// or wss:// URL');
+    }
     if (o.smoke) {
         o.preSeconds ??= 20;
         o.gapSeconds ??= 20;
         o.postSeconds ??= 20;
     }
     o.audioDir ??= path.join(o.outDir, 'audio');
-    o.label ??= `${o.condition}-${o.strict ? 'strict' : 'nostrict'}${o.smoke ? '-smoke' : ''}`;
+    o.label ??= `${o.condition}-${o.viaProxy ? 'proxy' : o.strict ? 'strict' : 'nostrict'}${o.smoke ? '-smoke' : ''}`;
     return o;
 }
 
@@ -166,8 +191,43 @@ function buildStartConfig(opts) {
     return cfg;
 }
 
+// Proxy mode: the config the web studio sends, field for field
+// (useSonioxConnection.ts). No api_key, language_hints_strict,
+// enable_language_identification or client_reference_id: the proxy adds the
+// first three and drops the rest (upstream.js buildSonioxConfig). The legacy
+// translation.source_language is sent because the studio sends it; the proxy
+// strips it before Soniox sees it.
+function buildProxyClientConfig(opts) {
+    const translation = {};
+    if (opts.sourceLanguage) translation.source_language = 'en';
+    translation.target_language = opts.target;
+    translation.type = 'one_way';
+    return {
+        model: opts.model,
+        audio_format: 'pcm_s16le',
+        sample_rate: SAMPLE_RATE,
+        language_hints: ['en'],
+        include_nonfinal: true,
+        enable_endpoint_detection: true,
+        translation,
+    };
+}
+
 function redact(cfg) {
-    return { ...cfg, api_key: '***' };
+    return 'api_key' in cfg ? { ...cfg, api_key: '***' } : cfg;
+}
+
+// The proxy URL as it may be logged: never with a token in it.
+function stripToken(base) {
+    const u = new URL(base);
+    u.searchParams.delete('token');
+    return u.toString();
+}
+
+function proxyUrlWithToken(base, jwt) {
+    const u = new URL(base);
+    u.searchParams.set('token', jwt);
+    return u.toString();
 }
 
 function newPhaseStats() {
@@ -192,7 +252,13 @@ function fmtLangs(map) {
 
 async function main() {
     const opts = parseArgs(process.argv.slice(2));
-    if (!process.env.SONIOX_API_KEY) {
+    const proxyMode = !!opts.viaProxy;
+    if (proxyMode) {
+        if (!process.env.HARNESS_JWT) {
+            console.error('error: HARNESS_JWT is not set in the environment (run through test/harness/mint-jwt.sh)');
+            process.exit(2);
+        }
+    } else if (!process.env.SONIOX_API_KEY) {
         console.error('error: SONIOX_API_KEY is not set in the environment');
         process.exit(2);
     }
@@ -206,14 +272,20 @@ async function main() {
     const summaryPath = path.join(opts.outDir, `${opts.label}.summary.json`);
     const jsonl = fs.createWriteStream(tokensPath, { flags: 'w' });
 
-    const startConfig = buildStartConfig(opts);
+    const endpoint = proxyMode ? stripToken(opts.viaProxy) : SONIOX_URL;
+    const connectUrl = proxyMode ? proxyUrlWithToken(opts.viaProxy, process.env.HARNESS_JWT) : SONIOX_URL;
+    const startConfig = proxyMode ? buildProxyClientConfig(opts) : buildStartConfig(opts);
+    const startMessage = proxyMode ? { action: 'start', config: startConfig } : startConfig;
+    const strict = proxyMode ? null : opts.strict; // null: the proxy decides
     const state = {
         t0: Date.now(), startedAt: new Date().toISOString(),
-        ackWallMs: null, startFailed: false,
+        ackWallMs: null, startFailed: false, authWallMs: null,
         bytesSent: 0, framesSent: 0, streamStartWall: null, audioDoneWall: null, streamingDone: false,
         finished: false, closed: false, closeInfo: null, summaryWritten: false,
         lastSpokenPhase: null, lastTranslationWall: null, lastOriginalWall: null, lastUpstreamWall: null,
         tokens: 0, finalTokens: 0, finTokens: 0, errors: [], events: [],
+        proxyReadyCount: 0, notices: [], noticeCounts: {}, lastProxyError: null,
+        failed: false, failureReason: null,
         phases: { pre: newPhaseStats(), gap: newPhaseStats(), post: newPhaseStats() },
         timers: {},
         upstreamSilentWarned: false,
@@ -225,6 +297,7 @@ async function main() {
         for (const p of audio.phases) if (ms < p.endMs) return p.name;
         return 'post';
     };
+    const currentPhase = () => (state.streamingDone ? 'done' : state.streamStartWall == null ? 'waiting' : phaseAtAudio(audioSentMs()));
 
     const writeLine = (obj) => { jsonl.write(`${JSON.stringify(obj)}\n`); };
     const logEvent = (event, extra = {}) => {
@@ -232,24 +305,29 @@ async function main() {
         state.events.push(rec);
         writeLine(rec);
         console.error(`[${opts.label}] ${event} ${JSON.stringify(extra)}`);
+        return rec;
     };
 
-    console.error(`[${opts.label}] gap=${GAP[opts.condition].name} strict=${opts.strict} impl=${impl} url=${SONIOX_URL}`);
+    console.error(`[${opts.label}] mode=${proxyMode ? 'proxy' : 'direct'} gap=${GAP[opts.condition].name} strict=${proxyMode ? 'proxy' : opts.strict} impl=${impl} url=${endpoint}`);
     console.error(`[${opts.label}] schedule: ${audio.phases.map((p) => `${p.name}=${((p.endMs - p.startMs) / 1000).toFixed(0)}s`).join(' ')} total=${totalSeconds.toFixed(0)}s`);
     console.error(`[${opts.label}] start config: ${JSON.stringify(redact(startConfig))}`);
-    writeLine({ type: 'meta', label: opts.label, condition: opts.condition, gap: GAP[opts.condition].name, strict: opts.strict, smoke: opts.smoke, started_at: state.startedAt, config: redact(startConfig), schedule: audio.phases });
+    writeLine({
+        type: 'meta', label: opts.label, mode: proxyMode ? 'proxy' : 'direct', endpoint, condition: opts.condition,
+        gap: GAP[opts.condition].name, strict, smoke: opts.smoke, started_at: state.startedAt,
+        config: redact(startConfig), schedule: audio.phases,
+    });
 
     const progress = (why = 'progress') => {
         const p = state.phases;
-        const phase = state.streamingDone ? 'done' : state.streamStartWall == null ? 'waiting' : phaseAtAudio(audioSentMs());
         const lastTrans = state.lastTranslationWall == null ? 'never' : `${((wallMs() - state.lastTranslationWall) / 1000).toFixed(0)}s ago`;
         const sum = (k) => p.pre[k] + p.gap[k] + p.post[k];
         const langs = {};
         for (const ph of Object.values(p)) for (const [k, v] of Object.entries(ph.languages)) langs[k] = (langs[k] || 0) + v;
         console.error(
-            `[${opts.label}] ${why} wall=${(wallMs() / 1000).toFixed(0)}s audio=${(audioSentMs() / 1000).toFixed(0)}s phase=${phase} ` +
+            `[${opts.label}] ${why} wall=${(wallMs() / 1000).toFixed(0)}s audio=${(audioSentMs() / 1000).toFixed(0)}s phase=${currentPhase()} ` +
             `finals none=${sum('finals_none')} orig=${sum('finals_original')} trans=${sum('finals_translation')} ` +
-            `langs=${fmtLangs(langs)} lastTrans=${lastTrans} errors=${state.errors.length} buffered=${ws.bufferedAmount ?? 0}`,
+            `langs=${fmtLangs(langs)} lastTrans=${lastTrans} errors=${state.errors.length}` +
+            `${proxyMode ? ` notices=${state.notices.length}` : ''} buffered=${ws.bufferedAmount ?? 0}`,
         );
     };
 
@@ -266,15 +344,19 @@ async function main() {
         const postSpoken = post.finals_original + post.finals_none;
         const preSpoken = pre.finals_original + pre.finals_none;
         const summary = {
-            label: opts.label, condition: opts.condition, gap: GAP[opts.condition].name, strict: opts.strict, smoke: opts.smoke,
-            model: opts.model, target: opts.target, soniox_url: SONIOX_URL, websocket_impl: impl,
+            label: opts.label, mode: proxyMode ? 'proxy' : 'direct', condition: opts.condition, gap: GAP[opts.condition].name,
+            strict, smoke: opts.smoke,
+            model: opts.model, target: opts.target, endpoint,
+            soniox_url: proxyMode ? null : SONIOX_URL, proxy_url: proxyMode ? endpoint : null, websocket_impl: impl,
             started_at: state.startedAt, ended_at: new Date().toISOString(),
             ack_wall_ms: state.ackWallMs, start_failed: state.startFailed,
+            auth_success_wall_ms: state.authWallMs, proxy_ready_count: state.proxyReadyCount,
             config: redact(startConfig),
             schedule: audio.phases.map((p) => ({ name: p.name, file: p.file, seconds: (p.endMs - p.startMs) / 1000 })),
             bytes_sent: state.bytesSent, audio_seconds_sent: state.bytesSent / BYTES_PER_SECOND,
             audio_seconds_planned: totalSeconds, wall_seconds: wallMs() / 1000,
             completed_audio: state.bytesSent >= totalBytes, finished: state.finished, close: state.closeInfo,
+            failed: state.failed, failure_reason: state.failureReason,
             tokens_total: state.tokens, final_tokens_total: state.finalTokens, fin_tokens: state.finTokens,
             phases: state.phases,
             translation_resumed: post.finals_translation > 0,
@@ -285,6 +367,10 @@ async function main() {
             post_translation_per_spoken: postSpoken ? post.finals_translation / postSpoken : null,
             stall_reproduced: postSpoken >= 5 && post.finals_translation === 0,
             errors: state.errors,
+            proxy_error_frames: state.errors.filter((e) => e.source === 'proxy').length,
+            soniox_error_frames: state.errors.filter((e) => e.source === 'soniox').length,
+            proxy_notices: state.notices.map(({ type, event, ...rest }) => rest),
+            proxy_notice_counts: state.noticeCounts,
             events: state.events.filter((e) => e.event !== 'phase_start').map(({ type, ...rest }) => rest),
             tokens_file: tokensPath,
         };
@@ -292,7 +378,7 @@ async function main() {
         console.error(`[${opts.label}] summary written: ${summaryPath}`);
     };
 
-    const exitCode = () => (state.startFailed ? 3 : state.bytesSent >= totalBytes ? 0 : 2);
+    const exitCode = () => (state.startFailed ? 3 : state.failed ? 4 : state.bytesSent >= totalBytes ? 0 : 2);
 
     const shutdown = () => {
         clearTimers();
@@ -300,7 +386,7 @@ async function main() {
         jsonl.end(() => process.exit(exitCode()));
     };
 
-    const ws = new WS(SONIOX_URL);
+    const ws = new WS(connectUrl);
 
     const finishStreaming = (aborted = false) => {
         if (state.streamingDone) return;
@@ -308,12 +394,23 @@ async function main() {
         state.audioDoneWall = wallMs();
         logEvent('audio_done', { bytes: state.bytesSent, audio_s: Number((state.bytesSent / BYTES_PER_SECOND).toFixed(1)), aborted });
         progress('audio_done');
+        let waitMs = FINISH_TIMEOUT_MS;
+        let timeoutEvent = 'finish_timeout';
         if (!aborted && ws.readyState === WS_OPEN) {
-            try { ws.send(''); logEvent('end_frame_sent'); } catch (e) { logEvent('end_frame_error', { message: e.message }); }
+            if (proxyMode) {
+                // The proxy ignores an empty text frame (it is not JSON) and never
+                // forwards a finished frame, so ask it to finalize the tail, give
+                // the tail a moment to arrive, then close from this side.
+                try { ws.send(JSON.stringify({ type: 'finalize' })); logEvent('finalize_sent'); } catch (e) { logEvent('finalize_error', { message: e.message }); }
+                waitMs = PROXY_TAIL_MS;
+                timeoutEvent = 'tail_done';
+            } else {
+                try { ws.send(''); logEvent('end_frame_sent'); } catch (e) { logEvent('end_frame_error', { message: e.message }); }
+            }
         }
         state.timers.finish = setTimeout(() => {
-            if (!state.closed) { logEvent('finish_timeout'); try { ws.close(1000, 'harness done'); } catch {} }
-        }, FINISH_TIMEOUT_MS);
+            if (!state.closed) { logEvent(timeoutEvent); try { ws.close(1000, 'harness done'); } catch {} }
+        }, waitMs);
     };
 
     const startStreaming = () => {
@@ -384,23 +481,87 @@ async function main() {
         }
     };
 
+    const failStart = (reason, event) => {
+        if (state.ackWallMs != null) return;
+        state.startFailed = true;
+        state.failureReason ??= reason;
+        logEvent(event, { reason });
+    };
+
+    // Proxy control frames. Returns true when the frame was one of them.
+    const onProxyControl = (msg) => {
+        switch (msg.type) {
+            case 'auth_success':
+                state.authWallMs = wallMs();
+                clearTimeout(state.timers.auth);
+                logEvent('auth_success', { connection_id: msg.connectionId ?? null });
+                try { ws.send(JSON.stringify(startMessage)); logEvent('start_sent'); } catch (e) { logEvent('start_send_error', { message: e.message }); }
+                state.timers.ack = setTimeout(() => {
+                    if (state.ackWallMs == null) {
+                        failStart(`no proxy_ready within ${PROXY_READY_TIMEOUT_MS} ms`, 'proxy_ready_timeout');
+                        try { ws.close(1000, 'proxy_ready timeout'); } catch {}
+                    }
+                }, PROXY_READY_TIMEOUT_MS);
+                return true;
+            case 'proxy_ready':
+                state.proxyReadyCount++;
+                if (state.proxyReadyCount === 1) {
+                    state.ackWallMs = wallMs();
+                    clearTimeout(state.timers.ack);
+                    logEvent('proxy_ready', { connection_id: msg.connection_id ?? null });
+                    startStreaming();
+                } else {
+                    // The relay promises exactly one per client connection; a second
+                    // one would make the web studio treat it as a fresh session.
+                    logEvent('proxy_ready_duplicate', { count: state.proxyReadyCount });
+                }
+                return true;
+            case 'proxy_notice': {
+                const extra = { ...msg };
+                delete extra.type;
+                delete extra.event;
+                const notice = msg.event ?? '?';
+                bump(state.noticeCounts, notice);
+                state.notices.push(logEvent('proxy_notice', { notice, phase: currentPhase(), ...extra }));
+                return true;
+            }
+            case 'error': {
+                const err = {
+                    source: 'proxy', t_wall_ms: wallMs(), audio_sent_ms: Math.round(audioSentMs()),
+                    code: msg.code ?? null, message: msg.message ?? null,
+                };
+                state.errors.push(err);
+                state.lastProxyError = err;
+                logEvent('error_frame', err);
+                failStart(`proxy error before ready: ${[err.code, err.message].filter((v) => v != null).join(' ')}`, 'start_rejected');
+                return true;
+            }
+            case 'pong':
+                return true;
+            default:
+                return false;
+        }
+    };
+
     const onMessage = (raw) => {
         const text = typeof raw === 'string' ? raw : Buffer.from(raw).toString('utf8');
         state.lastUpstreamWall = wallMs();
         state.upstreamSilentWarned = false;
         let msg;
         try { msg = JSON.parse(text); } catch { logEvent('unparseable_message', { length: text.length }); return; }
+        if (!msg || typeof msg !== 'object') { logEvent('unexpected_message', { length: text.length }); return; }
+        if (proxyMode && typeof msg.type === 'string' && onProxyControl(msg)) return;
         const isError = msg.error_code != null || msg.error_type != null;
         if (isError) {
             const err = {
-                t_wall_ms: wallMs(), audio_sent_ms: Math.round(audioSentMs()),
+                source: 'soniox', t_wall_ms: wallMs(), audio_sent_ms: Math.round(audioSentMs()),
                 error_code: msg.error_code ?? null, error_type: msg.error_type ?? null,
                 error_message: msg.error_message ?? msg.message ?? null, request_id: msg.request_id ?? null, more_info: msg.more_info ?? null,
             };
             state.errors.push(err);
             logEvent('error_frame', err);
         }
-        if (state.ackWallMs == null) {
+        if (!proxyMode && state.ackWallMs == null) {
             state.ackWallMs = wallMs();
             clearTimeout(state.timers.ack);
             if (isError) {
@@ -422,7 +583,17 @@ async function main() {
 
     ws.onopen = () => {
         logEvent('open');
-        try { ws.send(JSON.stringify(startConfig)); } catch (e) { logEvent('start_send_error', { message: e.message }); }
+        if (proxyMode) {
+            // The start message goes out on auth_success (see onProxyControl).
+            state.timers.auth = setTimeout(() => {
+                if (state.authWallMs == null) {
+                    failStart(`no auth_success within ${ACK_TIMEOUT_MS} ms`, 'auth_timeout');
+                    try { ws.close(1000, 'auth timeout'); } catch {}
+                }
+            }, ACK_TIMEOUT_MS);
+            return;
+        }
+        try { ws.send(JSON.stringify(startMessage)); } catch (e) { logEvent('start_send_error', { message: e.message }); }
         logEvent('start_sent');
         state.timers.ack = setTimeout(() => {
             if (state.ackWallMs == null) {
@@ -441,7 +612,21 @@ async function main() {
     ws.onclose = (ev) => {
         if (state.closed) return;
         state.closed = true;
-        state.closeInfo = { code: ev?.code ?? null, reason: String(ev?.reason ?? ''), t_wall_ms: wallMs(), audio_sent_ms: Math.round(audioSentMs()), completed_audio: state.bytesSent >= totalBytes };
+        const code = ev?.code ?? null;
+        const reason = String(ev?.reason ?? '');
+        state.closeInfo = { code, reason, t_wall_ms: wallMs(), audio_sent_ms: Math.round(audioSentMs()), completed_audio: state.bytesSent >= totalBytes };
+        if (proxyMode) {
+            if (code === 1011) {
+                // The relay gave up on Soniox (re-dials exhausted or a non-retryable
+                // account error): the error frame before this close says why.
+                state.failed = true;
+                const last = state.lastProxyError;
+                state.failureReason ??= `proxy closed 1011${reason ? ` (${reason})` : ''}${last?.message ? `: ${last.message}` : ''}`;
+                logEvent('run_failed', { reason: state.failureReason });
+            } else if (state.ackWallMs == null) {
+                failStart(`closed with ${code} before proxy_ready${reason ? ` (${reason})` : ''}`, 'closed_before_ready');
+            }
+        }
         logEvent('close', state.closeInfo);
         progress('final');
         shutdown();

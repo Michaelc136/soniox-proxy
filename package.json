@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js test/harness/*.test.js"
   },
   "dependencies": {
     "ws": "^8.16.0",

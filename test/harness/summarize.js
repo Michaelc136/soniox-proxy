@@ -31,6 +31,16 @@ const runs = files
     .map((f) => JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8')))
     .sort((a, b) => (a.strict === b.strict ? order[a.condition] - order[b.condition] : a.strict ? 1 : -1));
 
+// Proxy-mode runs (reproduce-stall.js --via-proxy) carry mode 'proxy'; older
+// summaries without a mode are direct runs.
+const isProxy = (r) => r.mode === 'proxy';
+const proxyRuns = runs.filter(isProxy);
+const strictCell = (r) => (isProxy(r) ? 'proxy' : yesno(r.strict));
+const errorCell = (e) => (e.source === 'proxy' ? `proxy ${e.code ?? ''}`.trim() : `${e.error_code ?? ''} ${e.error_type ?? ''}`.trim());
+const noticeCell = (r) => {
+    const counts = Object.entries(r.proxy_notice_counts || {});
+    return counts.length ? counts.map(([k, v]) => `${k}:${v}`).join(' ') : 'none';
+};
 const finals = (p) => `${p.finals_none}/${p.finals_original}/${p.finals_translation}`;
 const langs = (p) => {
     const e = Object.entries(p.languages).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k}:${v}`);
@@ -43,15 +53,17 @@ const header = [
     'Run', 'Gap', 'Strict', 'Pre finals (none/orig/trans)', 'Gap finals', 'Post finals',
     'Langs pre', 'Langs gap', 'Langs post', 'Translation resumed', 'First post-gap translation (s)',
     'Trans per spoken (pre -> post)', 'Errors', 'Close', 'Audio sent (min)',
+    ...(proxyRuns.length ? ['Proxy notices', 'Failed'] : []),
 ];
 const rows = runs.map((r) => [
-    r.label, r.gap, yesno(r.strict), finals(r.phases.pre), finals(r.phases.gap), finals(r.phases.post),
+    r.label, r.gap, strictCell(r), finals(r.phases.pre), finals(r.phases.gap), finals(r.phases.post),
     langs(r.phases.pre), langs(r.phases.gap), langs(r.phases.post), yesno(r.translation_resumed),
     num(r.seconds_to_first_post_gap_translation),
     `${num(r.pre_translation_per_spoken, 2)} -> ${num(r.post_translation_per_spoken, 2)}`,
-    r.errors.length ? r.errors.map((e) => `${e.error_code ?? ''} ${e.error_type ?? ''}`.trim()).join('; ') : 'none',
+    r.errors.length ? r.errors.map(errorCell).join('; ') : 'none',
     r.close ? `${r.close.code}${r.finished ? ' finished' : ''}` : '-',
     num(r.audio_seconds_sent / 60),
+    ...(proxyRuns.length ? [noticeCell(r), r.failed ? `yes (${r.failure_reason})` : 'no'] : []),
 ]);
 
 const nostrictStalls = runs.filter((r) => !r.strict && r.stall_reproduced);
@@ -70,25 +82,39 @@ const table = [
 ].join('\n');
 
 const liveSessions = process.env.HARNESS_LIVE_SESSIONS ?? 'unknown';
+const allProxy = proxyRuns.length === runs.length;
+const route = allProxy
+    ? `through the Selah proxy at \`${runs[0].proxy_url}\` (the proxy holds the Soniox key and sets language_hints_strict and language identification itself; "Strict" reads "proxy")`
+    : proxyRuns.length
+        ? `directly to Soniox (strict off/on runs) or through the Selah proxy (runs marked "proxy" in the Strict column)`
+        : `directly to \`${runs[0].soniox_url}\``;
+const strictVerdict = allProxy
+    ? 'not applicable (proxy mode: language_hints_strict is the proxy\'s setting, there is no strict-off run)'
+    : reproduced ? yesno(strictPrevented) : 'not applicable (no stall to prevent)';
 const md = `# Soniox translation stall, reproduction harness${smoke ? ' (smoke)' : ''}
 
 Generated ${new Date().toISOString()}. Live Selah sessions at start: ${liveSessions}. Runs: ${runs.length}. Total audio streamed: ${totalAudioMinutes.toFixed(1)} minutes.
 
-Each run streams English speech, then a gap, then English speech, directly to \`${runs[0].soniox_url}\` with model \`${runs[0].model}\`, hints [en], endpoint detection, language identification, one_way translation to ${runs[0].target}. "Finals" are final tokens split by translation_status (none / original / translation); "Langs" counts the \`language\` field of final spoken (none + original) tokens.
+Each run streams English speech, then a gap, then English speech, ${route} with model \`${runs[0].model}\`, hints [en], endpoint detection, language identification, one_way translation to ${runs[0].target}. "Finals" are final tokens split by translation_status (none / original / translation); "Langs" counts the \`language\` field of final spoken (none + original) tokens.
 
 ${table}
 
 ## Verdict
 
-- Stall reproduced (post-gap speech transcribed with zero translation tokens) in a strict-off run: **${yesno(reproduced)}**${reproduced ? ` (${nostrictStalls.map((r) => r.label).join(', ')})` : ''}.
+- Stall reproduced (post-gap speech transcribed with zero translation tokens) in a ${allProxy ? 'proxy' : 'strict-off'} run: **${yesno(reproduced)}**${reproduced ? ` (${nostrictStalls.map((r) => r.label).join(', ')})` : ''}.
 - Any run with a stall: ${anyStall.length ? anyStall.map((r) => r.label).join(', ') : 'none'}.
-- language_hints_strict prevented the stall in the matching strict-on run: **${reproduced ? yesno(strictPrevented) : 'not applicable (no stall to prevent)'}**.
+- language_hints_strict prevented the stall in the matching strict-on run: **${strictVerdict}**.${proxyRuns.length ? `
+- Proxy runs that failed (1011 close or no proxy_ready): ${proxyRuns.filter((r) => r.failed || r.start_failed).map((r) => `${r.label} (${r.failure_reason || 'start failed'})`).join(', ') || 'none'}.
+- Proxy runs with more than one proxy_ready (must be none): ${proxyRuns.filter((r) => r.proxy_ready_count > 1).map((r) => r.label).join(', ') || 'none'}.` : ''}
 
 ## Per-run notes
 
 ${runs.map((r) => {
-    const errs = r.errors.length ? r.errors.map((e) => `${e.error_code ?? ''} ${e.error_type ?? ''} ${e.error_message ?? ''}`.trim()).join('; ') : 'none';
-    return `- **${r.label}**: ${r.started_at} to ${r.ended_at}, wall ${num(r.wall_seconds / 60)} min, audio ${num(r.audio_seconds_sent / 60)} min, completed audio ${yesno(r.completed_audio)}, finished frame ${yesno(r.finished)}, close ${r.close ? r.close.code : '-'}, tokens ${r.tokens_total} (${r.final_tokens_total} final, ${r.fin_tokens} fin), end tokens pre/gap/post ${r.phases.pre.end_tokens}/${r.phases.gap.end_tokens}/${r.phases.post.end_tokens}, errors: ${errs}. Tokens: \`${path.basename(r.tokens_file)}\`.`;
+    const errs = r.errors.length ? r.errors.map((e) => (e.source === 'proxy' ? `proxy ${e.code ?? ''} ${e.message ?? ''}` : `${e.error_code ?? ''} ${e.error_type ?? ''} ${e.error_message ?? ''}`).trim()).join('; ') : 'none';
+    const proxyNote = isProxy(r)
+        ? ` Proxy: proxy_ready x${r.proxy_ready_count}, notices ${noticeCell(r)}, failed ${r.failed ? `yes (${r.failure_reason})` : 'no'}.`
+        : '';
+    return `- **${r.label}**: ${r.started_at} to ${r.ended_at}, wall ${num(r.wall_seconds / 60)} min, audio ${num(r.audio_seconds_sent / 60)} min, completed audio ${yesno(r.completed_audio)}, finished frame ${yesno(r.finished)}, close ${r.close ? r.close.code : '-'}, tokens ${r.tokens_total} (${r.final_tokens_total} final, ${r.fin_tokens} fin), end tokens pre/gap/post ${r.phases.pre.end_tokens}/${r.phases.gap.end_tokens}/${r.phases.post.end_tokens}, errors: ${errs}.${proxyNote} Tokens: \`${path.basename(r.tokens_file)}\`.`;
 }).join('\n')}
 `;
 
@@ -99,10 +125,13 @@ fs.writeFileSync(jsonPath, `${JSON.stringify({
     generated_at: new Date().toISOString(), live_sessions_at_start: liveSessions, reproduced_stall: reproduced,
     strict_prevented_stall: strictPrevented, total_audio_minutes: totalAudioMinutes,
     runs: runs.map((r) => ({
-        label: r.label, condition: r.condition, gap: r.gap, strict: r.strict, translation_resumed: r.translation_resumed,
+        label: r.label, mode: r.mode || 'direct', proxy_url: r.proxy_url ?? null, condition: r.condition, gap: r.gap, strict: r.strict,
+        translation_resumed: r.translation_resumed,
         stall_reproduced: r.stall_reproduced, seconds_to_first_post_gap_translation: r.seconds_to_first_post_gap_translation,
         pre: r.phases.pre, gap_phase: r.phases.gap, post: r.phases.post, errors: r.errors, close: r.close, finished: r.finished,
         completed_audio: r.completed_audio, audio_seconds_sent: r.audio_seconds_sent, wall_seconds: r.wall_seconds, tokens_file: r.tokens_file,
+        proxy_ready_count: r.proxy_ready_count ?? null, proxy_notice_counts: r.proxy_notice_counts ?? null,
+        failed: r.failed ?? false, failure_reason: r.failure_reason ?? null,
     })),
 }, null, 2)}\n`);
 console.log(md);
